@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(curl -s -m 30 \"https://hub.docker.com/v2/repositories/pytorch/pytorch/tags?page_size=100&name=cuda13&ordering=last_updated\")",
+      "Bash(python3 -c ' *)",
+      "Bash(getent group *)",
+      "Bash(sg docker *)",
+      "Read(//usr/bin/**)",
+      "Bash(/usr/bin/sg docker *)",
+      "Bash(chmod +x /run/media/mahin/Personal/code/python/run.sh)",
+      "Bash(sudo -n true)",
+      "WebFetch(domain:unsloth.ai)"
+    ]
+  }
+}

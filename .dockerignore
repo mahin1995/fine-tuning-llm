@@ -1,0 +1,3 @@
+# Nothing is COPY'd into the image (project is bind-mounted at run time),
+# so keep the build context empty. This also keeps the venv out of it.
+*
