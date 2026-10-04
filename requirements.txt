@@ -1,0 +1,16 @@
+# Pinned so a rebuild gets exactly the APIs train.py was written against.
+# torch is NOT listed: it comes from the pytorch/pytorch base image (CUDA build)
+# and the Dockerfile constrains pip so nothing can replace it.
+transformers==5.17.0
+trl==1.13.0
+peft==0.21.0
+bitsandbytes==0.50.2
+accelerate==1.15.0
+datasets==5.0.1
+huggingface_hub==1.33.0
+fastapi==0.142.2
+uvicorn[standard]==0.54.0
+
+# tests (small; kept in the image so ./run.sh python -m pytest works)
+pytest==9.1.1
+httpx==0.28.1

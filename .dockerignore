@@ -1,3 +1,4 @@
-# Nothing is COPY'd into the image (project is bind-mounted at run time),
-# so keep the build context empty. This also keeps the venv out of it.
+# The project is bind-mounted at run time, so only requirements.txt is COPY'd.
+# Keeping everything else out keeps the build context tiny (no venv, outputs, data).
 *
+!requirements.txt

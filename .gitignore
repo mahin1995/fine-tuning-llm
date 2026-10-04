@@ -1,0 +1,15 @@
+# training output (multi-GB weights / checkpoints)
+outputs/
+checkpoints/
+*.safetensors
+*.bin
+
+# python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+
+# local tooling
+.claude/settings.local.json

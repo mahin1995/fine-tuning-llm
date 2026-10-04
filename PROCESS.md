@@ -53,18 +53,11 @@ GPU pass-through into the container confirmed working.
 **Project image** — [Dockerfile](Dockerfile) adds the ML libraries on top of the
 base image:
 
-```dockerfile
-FROM pytorch/pytorch:2.14.0-cuda13.2-cudnn9-runtime
-
-# Throwaway container: overriding PEP 668 is safe here. `python -m pip` makes
-# sure packages land in the same interpreter that already has torch.
-RUN python -m pip install --no-cache-dir --break-system-packages \
-    --default-timeout=100 --retries 10 \
-    transformers trl datasets accelerate peft bitsandbytes \
-    fastapi "uvicorn[standard]"
-
-WORKDIR /workspace
-```
+The library versions are pinned in [requirements.txt](requirements.txt). Pip
+installs them with a constraint that locks the base image's CUDA torch, and the
+build fails if a CPU-only torch ends up installed. Before pinning, a rebuild would
+have pulled whatever was newest (transformers 5.18 had already been released),
+and a dependency could have replaced torch with a different build.
 
 Note: the base image's Python is Debian/Ubuntu's system Python (PEP 668,
 "externally-managed-environment"), so plain `pip install` is blocked by
@@ -79,12 +72,16 @@ disposable and nothing else depends on its system Python.
   the project aren't root-owned.
 - Falls back to `sudo docker` automatically if the `docker` group isn't active
   in the current shell yet.
-- Exposes port 8000 for the future chat API.
+- Uses `-it` only when a terminal is attached, so `nohup ./run.sh python train.py &` works.
+- Publishes a port only when `PORT=...` is set, bound to `127.0.0.1`, so training
+  and a debug shell can run side by side.
+- Sets `USER` for libraries that look up the user name (the mapped uid has no passwd entry).
 
 ```bash
-./run.sh build      # build the qwen-ft image
-./run.sh python ...  # run a command inside it
-./run.sh bash        # interactive shell
+./run.sh build                      # build the qwen-ft image
+./run.sh python ...                 # run a command inside it
+./run.sh bash                       # interactive shell
+PORT=8000 ./run.sh python serve.py  # with a published port
 ```
 
 **Verified** — all libraries import correctly, and torch is still the CUDA
@@ -111,7 +108,12 @@ field injection, global exception handling, auto-configuration, JPA fetch
 types, self-invocation proxy pitfall, rollback-on-checked-exceptions).
 
 **Validated:** all 10 lines are valid JSON with the expected `user`/`assistant`
-role structure.
+role structure. `validate_data.py` now checks this automatically, along with
+duplicates and train/eval leakage. With `--tokenizer` it also reports token lengths.
+
+[eval.jsonl](eval.jsonl) holds 8 held-out Q&A pairs on topics not in the training
+set (open-in-view, optimistic locking, `getReferenceById`, NESTED propagation, …),
+used by `evaluate.py`.
 
 **Note on dataset size:** 10 examples is only enough to smoke-test the
 pipeline. Training 3 epochs on this will make the model memorize these exact
@@ -144,49 +146,81 @@ Qwen2.5-0.5B-Instruct.
 ./run.sh python download_model.py
 ```
 
-*(Status: script written, not yet confirmed run — awaiting output.)*
+It also asserts that pad != eos and that the inference prompt
+(`add_generation_prompt=True`, `enable_thinking=False`) is an exact prefix of the
+training format. That check runs against the real Qwen3 template.
 
-## Step 4 — Training Script *(not yet started)*
+*(Status: script written and tested against a local tiny model; not yet run against the real Qwen3-0.6B download.)*
 
-Planned: `train.py` using `trl`'s `SFTTrainer`, with:
-- `per_device_train_batch_size=4`, `gradient_accumulation_steps=4`
-- `gradient_checkpointing=True`, `bf16=True`
-- `learning_rate=2e-5`, `num_train_epochs=3`
-- `adamw_8bit` optimizer (via `bitsandbytes`) to keep full fine-tuning inside
-  the RTX 3060's 12GB VRAM
-- OOM handling that suggests lowering batch size
-- Will be written against the actually-installed `transformers 5.17` /
-  `trl 1.13` APIs (both are recent major versions, so signatures are checked
-  against installed source rather than assumed).
+## Step 4 — Training Script *(written, tested on CPU)*
 
-## Step 5 — Training Run *(not started)*
+[train.py](train.py) uses TRL `SFTTrainer` and was checked against the installed
+`transformers 5.17` / `trl 1.13` source:
+- Data is converted to **prompt-completion** format, so loss is only on the final
+  assistant answer. `assistant_only_loss` needs `{% generation %}` markers that
+  Qwen3's template doesn't have.
+- `chat_template_kwargs={"enable_thinking": False}` is passed per example, so training
+  uses the same format as inference.
+- **Full FT:** weights loaded in **fp32** with `bf16=True` autocast. Pure-bf16 weights
+  would round small lr=2e-5 updates away. `adamw_8bit` plus gradient checkpointing
+  keep this within 12GB.
+- **`--lora`:** frozen bf16 base, r=16 adapters on all attention + MLP projections,
+  lr 2e-4. `--merge` also writes a merged full model.
+- Prints the number of optimizer steps and warns below 10. The original plan
+  (batch 4 × accum 4 on 10 examples, 3 epochs) gives only **3 steps**.
+- Catches CUDA OOM and prints concrete flags to retry with.
+- Writes `run_info.json` (base model, args, metrics, library versions) next to the model.
+- transformers 5 removed `warmup_ratio`; the script uses `warmup_steps=<float ratio>`.
 
-Run `train.py` inside the container, monitor `nvidia-smi` and the loss curve,
-retry with a smaller batch size on OOM, confirm the saved checkpoint path.
+## Step 5 — Training Run *(not started — needs the GPU host)*
 
-## Step 6 — Evaluation *(not started)*
+```bash
+./run.sh python train.py --epochs 10 --batch-size 2 --grad-accum 1   # smoke test, 10 examples
+nohup ./run.sh python train.py > train.log 2>&1 &                    # real run
+```
 
-Load the fine-tuned checkpoint, compare outputs against the base model on a
-few held-out prompts.
+## Step 6 — Evaluation *(written, tested on CPU)*
 
-## Step 7 — Chat CLI *(not started, replaces GGUF conversion)*
+[evaluate.py](evaluate.py) loads the base and fine-tuned models one at a time and,
+for each `eval.jsonl` example, records:
+- the **answer loss**: mean NLL of the reference answer, lower is better
+- the greedy answer from each model
 
-Ollama was uninstalled, so the GGUF/`ollama create` steps from the original
-plan are dropped. Instead:
-- `inference.py` — shared model-loading/generation code
-- `chat.py` — interactive terminal chat using the Qwen chat template
-  (`enable_thinking=False` by default for Qwen3)
+It writes `outputs/qwen3-ft/eval_report.md`.
 
-## Step 8 — Chat API + Web UI *(not started)*
+## Step 7 — Chat CLI *(written, tested on CPU)*
 
-`serve.py` — FastAPI app exposing a `/chat` endpoint, plus a simple HTML page
-served at `/` for chatting from the browser. Port 8000 is already forwarded by
-`run.sh`.
+- [inference.py](inference.py) holds the shared loading code (full model or LoRA
+  adapter, merged on load) and generation (Qwen3 non-thinking sampling defaults,
+  streaming, early stop).
+- [chat.py](chat.py) is an interactive chat with streaming output, `/reset`,
+  `/exit`, `--system` and bounded history.
+
+## Step 8 — Chat API + Web UI *(written, tested on CPU)*
+
+[serve.py](serve.py) is a FastAPI app with `GET /`
+([static/index.html](static/index.html)), `GET /health` and `POST /chat`. Requests
+are validated with the same rules as the training data, plus limits on message
+count, content length, `max_new_tokens` and temperature. Generation runs in a
+worker thread behind a lock, so the single GPU model is never called concurrently.
+
+## Tests
+
+`python -m pytest` runs 42 tests on CPU in about 5s with no network access. They use
+a tiny Qwen3-architecture model built locally (`tests/conftest.py`) and cover:
+- data validation
+- train/inference template consistency (text and token ids)
+- full and LoRA training, including saving and merging
+- an overfit check that confirms training actually lowers loss
+- loading and generating, including stream stop
+- `evaluate.py` end to end
+- the API's validation
 
 ## Open items / decisions made along the way
 
-- Full fine-tuning (not LoRA) was chosen, made feasible on 8–12GB VRAM via
-  bf16 weights + 8-bit AdamW optimizer states.
+- Full fine-tuning remains the default, now with fp32 master weights, bf16 autocast
+  and 8-bit AdamW. `--lora` is available and is the safer choice while the
+  dataset is small.
 - No GGUF/Ollama step — the fine-tuned model is served directly via
   `transformers` + FastAPI.
 - All project files and the HF model cache live under this project directory
