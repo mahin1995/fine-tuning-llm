@@ -217,6 +217,7 @@ class OpsResult:
     attempts: int
     errors: list[str]
     intent: str | None
+    params: dict  # the final proposal's parameters (empty if there was no valid proposal)
     tool_calls: list[ToolCallRecord]
 
 
@@ -227,5 +228,6 @@ def run_request(deps: FlowDeps, request: str, role: Role, request_id: str | None
     return OpsResult(
         correlation_id=s.correlation_id, outcome=s.outcome, message=s.message, data=dict(s.data),
         attempts=s.attempts, errors=list(s.errors), intent=s.proposal.intent.value if s.proposal else None,
+        params=s.proposal.params.model_dump(exclude_none=True) if s.proposal else {},
         tool_calls=list(s.tool_calls),
     )
