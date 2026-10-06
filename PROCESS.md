@@ -278,14 +278,52 @@ add_example and remove_example. **The LLM proposes, deterministic code decides a
      Fixed with an `already_executed` pass-through for role-checked replays.
   2. A missing API key surfaced as 3 retried crew failures. Fixed by checking every LLM at startup.
 
+## Step 12 — Self-correction and reflection (`refiner`, PydanticAI) *(written, tested offline)*
+
+**Problem:** the flow's retries were blind. At temperature 0, re-sending the same prompt
+tends to reproduce the same invalid output.
+
+- **`refiner/`:** a new, domain-agnostic package that depends only on pydantic and pydantic_ai.
+  - `self_correct()` returns typed output. Pydantic schema errors and every problem reported by a
+    check go back to the model as `ModelRetry` feedback, within a retry budget and request limit.
+  - `reflect()` runs critic → reviser rounds and keeps the best-scoring version, so a flip-flop
+    can't make the result worse. It stops on acceptance, after max rounds, when the score stops
+    improving, or when the output repeats. Ungrounded drafts are capped at a score of 0.5.
+  - Models: OpenAI-compatible, Ollama, or any local text function (including this repo's
+    `qwen_ft`). Output modes are `tool`, `native` and `prompted`, with a `FallbackModel` that
+    also falls back on network errors.
+- **ops_crew integration:**
+  - `domain/correction.py` separates correctable problems from final ones.
+  - `validate_parts` keeps the good parts of a crew run.
+  - The flow repairs a broken proposal instead of re-running the crew. Crew re-runs are kept for
+    transient failures only.
+  - A new `reflect_on_proposal` step runs before authorization.
+  - `refinement.py` is the only bridge to `refiner`. Config lives in `config/refine.yaml`.
+- **Version research** (all verified by installing and running, not from docs):
+  - pydantic-ai 2.x needs `openai>=3`, but crewai 1.15 requires `openai<3`.
+  - pydantic-ai 1.23 installs but crashes on import (`opentelemetry._events` was removed in
+    opentelemetry-api 1.45, which crewai pulls in). `pip check` misses this.
+  - **1.107.7 `[openai]`** works alongside crewai.
+  - The `[anthropic]` extra conflicts with crewai's `anthropic` pin, so the refiner has no
+    Anthropic support for now.
+- **Found by tests while building:** the previous phase's oracle crew had been subtly
+  rewriting user answers and proposing ids the research never found. The new verbatim and
+  research-id checks caught both.
+- **Evals:** a new golden case, `add_wrong_example_caught_by_reflection`. It fails without the
+  refiner (the wrong example gets added) and passes with it. The report now includes
+  self-correction and reflection statistics.
+- **Not yet run against a real LLM** (none is reachable from the dev container).
+
 ## Tests
 
-`python -m pytest` runs 210 tests offline. The ops_crew tests skip themselves
+`python -m pytest` runs 255 tests offline. The ops_crew tests skip themselves
 when `requirements-crew.txt` isn't installed. They cover:
 - **qwen_ft:** data, training (full and LoRA), template consistency, evaluation, serving
 - **agent:** the loop, the parser, tools and calculator safety, Qwen integration
 - **ops_crew:** the domain layer, every flow route with a mocked crew, real CrewAI
   agents on scripted LLMs, evals with an oracle crew
+- **refiner:** self-correction in all output modes, the reflection loop, fallback, local function models
+- **ops_crew + refiner:** every new flow route, the real adapter on FunctionModels
 - **architecture:** package boundaries
 
 ## Open items / decisions made along the way

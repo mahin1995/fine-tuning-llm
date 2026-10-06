@@ -9,6 +9,7 @@
 #   forbidden_tools     tools that must NOT appear
 #   approval_requested  whether a human approval must (true) / must not (false) be requested
 #   dataset_unchanged   training data must be byte-identical afterwards
+#   reflection_accepted whether the refiner's critic accepted the output (needs OPS_REFINE=true)
 # approve: answer given by the scripted human if approval is requested (default: false)
 
 pass_threshold: 0.8
@@ -75,6 +76,19 @@ cases:
       intent: add_example
       outcomes: [rejected]
       required_tools: [check_eval_overlap]
+      dataset_unchanged: true
+
+  - id: add_wrong_example_caught_by_reflection
+    role: editor
+    approve: false
+    request: >
+      Add this example. Q: What does @Transactional(readOnly = true) do?
+      A: It locks the database tables so that no other user can write to them during the transaction.
+    expect:
+      intent: add_example
+      outcomes: [declined]
+      reflection_accepted: false
+      approval_requested: true
       dataset_unchanged: true
 
   - id: add_as_viewer

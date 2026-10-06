@@ -31,6 +31,7 @@ class Expectation(BaseModel):
     forbidden_tools: list[str] = Field(default_factory=list)
     approval_requested: bool | None = None
     dataset_unchanged: bool | None = None
+    reflection_accepted: bool | None = None  # needs the refiner (OPS_REFINE=true)
 
 
 class GoldenCase(BaseModel):
@@ -76,6 +77,8 @@ class CaseResult:
     tools: list[str]
     message: str
     errors: list[str] = field(default_factory=list)
+    repairs: int = 0
+    reflection: dict | None = None
 
 
 def _digest(path: Path) -> str:
@@ -103,6 +106,11 @@ def check(case: GoldenCase, result: OpsResult, approval_requested: bool, dataset
         failures.append(f"approval requested={approval_requested}, expected {exp.approval_requested}")
     if exp.dataset_unchanged is not None and dataset_changed == exp.dataset_unchanged:
         failures.append("dataset changed" if dataset_changed else "dataset was expected to change but did not")
+    if exp.reflection_accepted is not None:
+        if result.reflection is None:
+            failures.append("no reflection ran (is the refiner enabled?)")
+        elif result.reflection["accepted"] != exp.reflection_accepted:
+            failures.append(f"reflection accepted={result.reflection['accepted']}, expected {exp.reflection_accepted}")
     return failures
 
 
@@ -114,7 +122,8 @@ def run_case(case: GoldenCase, make_deps: Callable[[GoldenCase, ScriptedApproval
     changed = _digest(deps.repo.train_path) != before
     failures = check(case, result, approval.requested, changed)
     return CaseResult(case.id, not failures, failures, result.outcome, result.intent,
-                      [c.tool for c in result.tool_calls], result.message, result.errors)
+                      [c.tool for c in result.tool_calls], result.message, result.errors,
+                      result.repairs, result.reflection)
 
 
 @dataclass
@@ -130,9 +139,21 @@ class SuiteReport:
     def passed(self) -> bool:
         return self.pass_rate >= self.threshold
 
+    @property
+    def refinement_stats(self) -> dict:
+        reflected = [r.reflection for r in self.results if r.reflection]
+        scores = [r["score"] for r in reflected if r["score"] is not None]
+        return {
+            "cases_self_corrected": sum(r.repairs > 0 for r in self.results),
+            "cases_reflected": len(reflected),
+            "reflection_accepted": sum(r["accepted"] for r in reflected),
+            "reflection_revised": sum(r["rounds"] > 0 for r in reflected),
+            "mean_reflection_score": round(sum(scores) / len(scores), 3) if scores else None,
+        }
+
     def to_dict(self):
         return {"pass_rate": self.pass_rate, "threshold": self.threshold, "passed": self.passed,
-                "cases": [asdict(r) for r in self.results]}
+                "refinement": self.refinement_stats, "cases": [asdict(r) for r in self.results]}
 
 
 def run_suite(suite: GoldenSuite, make_deps, threshold: float | None = None, only: list[str] | None = None,
@@ -153,7 +174,11 @@ def format_report(report: SuiteReport) -> str:
         mark = "PASS" if r.passed else "FAIL"
         lines.append(f"{mark}  {r.case_id:<28} outcome={r.outcome:<21} intent={r.intent} tools={r.tools}")
         lines += [f"        - {f}" for f in r.failures]
-    lines.append(f"\npass rate {report.pass_rate:.0%} (threshold {report.threshold:.0%}): "
+    stats = report.refinement_stats
+    lines.append(f"\nself-corrected: {stats['cases_self_corrected']} case(s); reflected: {stats['cases_reflected']} "
+                 f"(accepted {stats['reflection_accepted']}, revised {stats['reflection_revised']}, "
+                 f"mean score {stats['mean_reflection_score']})")
+    lines.append(f"pass rate {report.pass_rate:.0%} (threshold {report.threshold:.0%}): "
                  f"{'OK' if report.passed else 'BELOW THRESHOLD'}")
     return "\n".join(lines)
 

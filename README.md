@@ -37,7 +37,13 @@ ops_crew/                 hybrid CrewAI agent: Dataset Ops Assistant  -> python 
                           approval, audit, repository, executor            (no CrewAI)
   flow.py                 CrewAI Flow: intake -> crew -> validate -> authorize -> approve -> execute
   crew/                   3-agent sequential crew, read-only tools, LLM factory with fallbacks
-  evals/                  13 golden cases + runner              -> python -m ops_crew.evals
+  evals/                  14 golden cases + runner              -> python -m ops_crew.evals
+  refinement.py           adapter to `refiner` (the only module that imports it)
+
+refiner/                  generic self-correction + reflection on PydanticAI (domain-agnostic)
+  correction.py           self_correct(): typed output, schema/check problems fed back as ModelRetry
+  reflection.py           reflect(): critic -> reviser loop, best-so-far, stop rules
+  models.py               OpenAI-compatible / Ollama / local function models, output modes, fallback
 
 tests/                    CPU tests (tiny local Qwen3 model, scripted LLMs for CrewAI), incl. architecture rules
 ```
@@ -55,6 +61,8 @@ tests/                    CPU tests (tiny local Qwen3 model, scripted LLMs for C
 | `qwen_ft.cli` | anything (composition root) |
 | `agent` core (loop, tools, parser, builtin_tools) | nothing from `qwen_ft` |
 | `agent/backends/qwen.py`, `agent/__main__.py` | `qwen_ft` (the only bridge) |
+| `refiner` | only `pydantic` / `pydantic_ai` (no project package) |
+| `ops_crew/refinement.py` | `refiner` (the only module that may) |
 
 `qwen_ft` never imports `agent`. `ops_crew.domain` imports no CrewAI and only reuses
 `qwen_ft.data`; only `ops_crew/crew/`, `flow.py`, `evals/` and `__main__` import CrewAI;
@@ -175,6 +183,40 @@ Idempotency store: `outputs/ops/idempotency.jsonl`; pass `--request-id` to scope
 | Prompt injection | Delimited, neutralised user and tool text; read-only tools; role from caller; markers force approval for side effects |
 | Low confidence | Clarifying question, or escalation if there is none |
 | LLM provider failure | Provider fallback chain, then retry, then escalation; missing keys fail at startup |
+
+## Self-correction and reflection (`refiner` + `ops_crew/refinement.py`)
+
+Blind retries re-send the same prompt; at temperature 0 the model tends to repeat the same
+mistake. `refiner` (PydanticAI) instead tells the model exactly what was wrong:
+
+```
+crew proposal ─► validate each task output ─► correctable problem? ─yes─► REPAIR (self_correct)
+                                               │                           schema errors + check problems
+                                               no                          sent back as feedback (max 2)
+                                               ▼
+                         ask:          CRITIC ─► score < 0.7? ─► REVISER ─► CRITIC ... (max 2 rounds,
+                                                                                    best-so-far wins)
+                         add_example:  CRITIC only (the user's Q&A is never rewritten);
+                                       low score -> issues -> human approval
+                                               ▼
+                                     policy.authorize (code always has the last word)
+```
+
+- **Correctable** (fed back to the model): malformed JSON / schema errors, empty answer, add params
+  not copied verbatim, an example id the research never found, an unexplained intent change.
+- **Final** (no retry, policy decides): role denials, duplicates, eval-set leakage, unsupported intents.
+- Feedback texts are written by code, never copied from user or tool text; untrusted text in
+  prompts is delimited and its tags neutralised.
+- Reflection is a quality gate, not a single point of failure: if the critic is down, answers
+  proceed unchanged and the policy still decides.
+- Config: `ops_crew/config/refine.yaml` (threshold, rounds, retries, a profile per role:
+  repair / critic / reviser). `OPS_REFINE_PROFILE_CRITIC=openai` puts a stronger model on the
+  critic; `OPS_REFINE=false` switches the whole layer off.
+- Local models work: profiles with a `base_url` (Ollama, vLLM, llama.cpp) default to
+  `output_mode: prompted` (schema in the prompt, no tool calling needed); set `tool` or
+  `native` per profile in `llms.yaml` if your server supports it.
+- PydanticAI is pinned to 1.107.7 for compatibility with CrewAI 1.15, and Anthropic profiles
+  aren't available to the refiner; see `requirements-crew.txt` for the reasons.
 
 ## Key design decisions
 

@@ -2,7 +2,8 @@
 
 Fine-tuning harness for Qwen3-0.6B (`qwen_ft/`: TRL SFT, full or LoRA, eval, CLI chat, FastAPI),
 a model-agnostic tool-calling agent loop (`agent/`), and a hybrid CrewAI agent (`ops_crew/`:
-deterministic Flow + 3-agent crew) that curates the training data.
+deterministic Flow + 3-agent crew) that curates the training data, with self-correction and
+reflection from the generic `refiner/` package (PydanticAI).
 README.md has the layout, dependency rules and commands; PROCESS.md has the decision log.
 
 ## Commands
@@ -22,6 +23,8 @@ README.md has the layout, dependency rules and commands; PROCESS.md has the deci
 - `ops_crew/domain/` is plain Python: no CrewAI, and from `qwen_ft` only `qwen_ft.data`. Only
   `ops_crew/crew/`, `flow.py`, `evals/` and `__main__.py` import CrewAI. `qwen_ft`, `agent` and
   `ops_crew` never import each other sideways.
+- `refiner/` imports only pydantic / pydantic_ai (it is domain-agnostic). Only
+  `ops_crew/refinement.py` imports `refiner`; the flow talks to it through `domain.ports.Refiner`.
 
 ## Rules that keep the pipeline correct
 - Training, inference and the agent must render prompts identically: always pass
@@ -47,3 +50,13 @@ README.md has the layout, dependency rules and commands; PROCESS.md has the deci
 - CrewAI 1.15: Flow route labels must differ from method names; LLMs come from `crew/llm.py`
   profiles (temperature forced to 0); keys only via env vars named in `llms.yaml`.
 - Tests drive real CrewAI objects with scripted `BaseLLM`s (see tests/test_ops_crew.py); keep them offline.
+
+## refiner rules
+- Only problems the model can legitimately fix go back to it (`domain/correction.py`); rule
+  violations (role, duplicate, leakage) stay final in policy.py. Never add a policy rule as a
+  "correctable" check.
+- Feedback text is produced by our code. Never paste user or tool text into a problem message.
+- add_example content is the user's: reflection may critique it but never rewrite it.
+- Pydantic-ai is pinned to 1.107.7 (crewai compatibility). Before upgrading either library,
+  check that both import together (`pip check` misses the opentelemetry conflict).
+- refiner tests use FunctionModels with `pydantic_ai.models.ALLOW_MODEL_REQUESTS = False`.

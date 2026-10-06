@@ -14,7 +14,7 @@ from conftest import EVAL_DATA, TRAIN_DATA
 
 
 def make_run(intent="ask", *, params=None, answer=None, confidence=0.9, classifier_confidence=None,
-             issues=None, clarifying_question=None, tool_calls=None, **overrides) -> CrewRun:
+             issues=None, clarifying_question=None, tool_calls=None, related_ids=None, **overrides) -> CrewRun:
     """A well-formed crew run; override any task output with raw text via overrides."""
     params = params or {}
     outputs = {
@@ -23,7 +23,7 @@ def make_run(intent="ask", *, params=None, answer=None, confidence=0.9, classifi
             "confidence": confidence if classifier_confidence is None else classifier_confidence,
             "clarifying_question": clarifying_question,
         }),
-        "research_context": json.dumps({"summary": "context gathered", "related_example_ids": []}),
+        "research_context": json.dumps({"summary": "context gathered", "related_example_ids": related_ids or []}),
         "review_proposal": json.dumps({
             "intent": intent, "params": params, "answer": answer, "rationale": "reviewed",
             "issues": issues or [], "confidence": confidence, "clarifying_question": clarifying_question,
