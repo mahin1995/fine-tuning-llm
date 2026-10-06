@@ -42,6 +42,9 @@ class LlmProfile(_Strict):
     timeout: float = Field(default=60, gt=0)
     max_tokens: int | None = Field(default=None, gt=0)
     fallbacks: list[str] = Field(default_factory=list)
+    # How the refiner (PydanticAI) asks this model for typed output: tool | native | prompted.
+    # Unset: "prompted" for local / in-process models (works without tool calling), "tool" otherwise.
+    output_mode: Literal["tool", "native", "prompted"] | None = None
 
 
 class AgentSpec(_Strict):

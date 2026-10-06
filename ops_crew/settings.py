@@ -22,6 +22,7 @@ class OpsSettings(BaseSettings):
     max_request_chars: int = Field(default=4000, gt=0)
 
     llm_profile: str | None = None  # override every agent's LLM profile (see config/llms.yaml)
+    refine: bool = True  # self-correction + reflection via the refiner package (config/refine.yaml)
 
     @property
     def audit_log_path(self) -> Path:

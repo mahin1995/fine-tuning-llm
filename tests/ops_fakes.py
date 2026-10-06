@@ -50,6 +50,34 @@ class FakeProposer:
         return result
 
 
+class FakeRefiner:
+    """Scripted Refiner: `repairs` (proposals or exceptions) and `reviews` (ReflectionOutcome or exceptions)."""
+
+    def __init__(self, repairs=(), reviews=()):
+        self.repairs = list(repairs)
+        self.reviews = list(reviews)
+        self.repair_calls = []
+        self.review_calls = []
+
+    def _next(self, queue):
+        item = queue.pop(0)
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+    def repair(self, req):
+        self.repair_calls.append(req)
+        return self._next(self.repairs)
+
+    def review_answer(self, request, proposal, findings):
+        self.review_calls.append(("ask", proposal))
+        return self._next(self.reviews)
+
+    def assess_example(self, request, proposal, findings):
+        self.review_calls.append(("add_example", proposal))
+        return self._next(self.reviews)
+
+
 class RecordingApprovals:
     def __init__(self, answer: bool):
         self.answer = answer
@@ -67,7 +95,7 @@ def copy_datasets(tmp_path):
     return DatasetRepository(train, evals)
 
 
-def build_deps(tmp_path, proposer, approvals=None, **settings_overrides):
+def build_deps(tmp_path, proposer, approvals=None, refiner=None, **settings_overrides):
     from ops_crew.flow import FlowDeps  # needs crewai
 
     repo = copy_datasets(tmp_path)
@@ -82,8 +110,9 @@ def build_deps(tmp_path, proposer, approvals=None, **settings_overrides):
         settings=OpsSettings(train_data=repo.train_path, eval_data=repo.eval_path, state_dir=tmp_path,
                              **settings_overrides),
         new_correlation_id=lambda: next(ids),
+        refiner=refiner,
     )
     return deps, sink
 
 
-__all__ = ["make_run", "FakeProposer", "RecordingApprovals", "copy_datasets", "build_deps", "ProposerError"]
+__all__ = ["make_run", "FakeProposer", "FakeRefiner", "RecordingApprovals", "copy_datasets", "build_deps", "ProposerError"]

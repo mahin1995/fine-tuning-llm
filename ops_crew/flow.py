@@ -4,12 +4,22 @@
                            └─ input_ok ──► propose (crew + validation, retries)
                                              ├─ needs_escalation ──► escalate
                                              ├─ low_confidence ────► clarify
-                                             └─ proposal_ready ────► authorize_proposal
+                                             └─ proposal_ready ────► reflect_on_proposal
+                                                                       ├─ needs_escalation ► escalate
+                                                                       └─ reviewed ──► authorize_proposal
                                                                        ├─ denied ──────────► reject_proposal
                                                                        ├─ authorized ──────► execute_action
                                                                        └─ approval_required ► request_approval
                                                                                                ├─ approved ─► execute_action
                                                                                                └─ declined ─► decline
+
+With a Refiner (ops_crew/refinement.py, built on the `refiner` package):
+- propose: a malformed or correctable proposal is repaired with feedback-driven retries
+  (self-correction) instead of re-running the whole crew blindly; crew re-runs remain
+  only for transient failures (provider errors, timeouts, broken classification/research)
+- reflect_on_proposal: answers (ask) are critiqued and revised; new examples (add_example)
+  are critiqued only, and a low score turns into reviewer issues -> human approval
+Without a Refiner both steps behave exactly as before (blind retries, no reflection).
 
 Every terminal step writes a "finished" audit record. The flow only orders the steps;
 all decisions are made by functions in ops_crew.domain.
@@ -29,11 +39,12 @@ from ops_crew.domain.actions import ActionExecutor
 from ops_crew.domain.approval import ApprovalGateway, ApprovalRequest
 from ops_crew.domain.audit import AuditLog
 from ops_crew.domain.inputs import InputRejected, clean_request
+from ops_crew.domain.correction import REFLECTED_INTENTS, correctable_problems, reflection_route
 from ops_crew.domain.policy import Outcome, authorize
-from ops_crew.domain.ports import Proposer, ProposerError
+from ops_crew.domain.ports import Proposer, ProposerError, Refiner, RepairRequest
 from ops_crew.domain.repository import DatasetRepository
-from ops_crew.domain.validation import validate_run
-from ops_crew.schemas import ActionProposal, Intent, Role, ToolCallRecord, ValidatedRun
+from ops_crew.domain.validation import validate_parts, validate_run
+from ops_crew.schemas import ActionProposal, Intent, ResearchFindings, Role, ToolCallRecord, ValidatedRun
 from ops_crew.settings import OpsSettings
 
 
@@ -46,6 +57,7 @@ class FlowDeps:
     audit: AuditLog
     settings: OpsSettings
     new_correlation_id: Callable[[], str] = field(default=lambda: uuid.uuid4().hex[:12])
+    refiner: Refiner | None = None  # None: blind retries, no reflection (original behaviour)
 
 
 class OpsState(BaseModel):
@@ -59,6 +71,9 @@ class OpsState(BaseModel):
     attempts: int = 0
     errors: list[str] = Field(default_factory=list)
     proposal: ActionProposal | None = None
+    findings: ResearchFindings | None = None
+    repairs: int = 0
+    reflection: dict = Field(default_factory=dict)
     tool_calls: list[ToolCallRecord] = Field(default_factory=list)
     decision_reasons: list[str] = Field(default_factory=list)
     outcome: str = ""
@@ -121,6 +136,58 @@ class OpsFlow(Flow[OpsState]):
 
     @router("input_ok")
     def propose(self):
+        if self._deps.refiner is None:
+            return self._propose_with_blind_retries()
+        return self._propose_with_self_correction()
+
+    def _run_crew(self):
+        return run_with_timeout(
+            lambda: self._deps.proposer.propose(self.state.clean_text, self.state.correlation_id),
+            self._deps.settings.crew_timeout_seconds,
+        )
+
+    def _propose_with_self_correction(self):
+        for attempt in range(1, self._deps.settings.max_retries + 2):
+            self.state.attempts = attempt
+            try:
+                run = self._run_crew()
+            except Exception as e:  # transient (provider, timeout): re-running the crew is the right fix
+                self._attempt_failed(attempt, type(e).__name__, str(e))
+                continue
+            parts = validate_parts(run)
+            if not parts.context_ok:  # without a valid classification + research there is nothing to repair
+                self._attempt_failed(attempt, "OutputValidationError", "; ".join(parts.errors.values()))
+                continue
+            if parts.proposal is None:
+                problems, previous = [parts.errors["review_proposal"]], run.outputs.get("review_proposal", "")
+            else:
+                problems = correctable_problems(parts.proposal, parts.classification, parts.findings,
+                                                self.state.clean_text)
+                previous = parts.proposal.model_dump_json()
+            proposal = parts.proposal
+            if problems:
+                proposal = self._repair(RepairRequest(self.state.clean_text, parts.classification, parts.findings,
+                                                      previous, problems))
+                if proposal is None:
+                    return "needs_escalation"
+            return self._accept(ValidatedRun(classification=parts.classification, findings=parts.findings,
+                                             proposal=proposal, tool_calls=run.tool_calls))
+        return "needs_escalation"
+
+    def _repair(self, req: RepairRequest) -> ActionProposal | None:
+        self._audit("self_correction_started", problems=req.problems)
+        try:
+            proposal = run_with_timeout(lambda: self._deps.refiner.repair(req),
+                                        self._deps.settings.crew_timeout_seconds)
+        except Exception as e:  # RefinementError, timeout, provider errors
+            self.state.errors.append(f"self-correction failed: {type(e).__name__}: {e}")
+            self._audit("self_correction_failed", error_type=type(e).__name__, error=str(e)[:500])
+            return None
+        self.state.repairs += 1
+        self._audit("self_correction_succeeded", intent=proposal.intent.value)
+        return proposal
+
+    def _propose_with_blind_retries(self):
         settings = self._deps.settings
         for attempt in range(1, settings.max_retries + 2):
             self.state.attempts = attempt
@@ -143,6 +210,7 @@ class OpsFlow(Flow[OpsState]):
     def _accept(self, validated: ValidatedRun):
         proposal = validated.proposal
         self.state.proposal = proposal
+        self.state.findings = validated.findings
         self.state.tool_calls = validated.tool_calls
         confidence = min(proposal.confidence, validated.classification.confidence)
         self._audit("proposal_validated", intent=proposal.intent.value, confidence=confidence,
@@ -166,6 +234,36 @@ class OpsFlow(Flow[OpsState]):
         return self._finish("escalated", f"escalated to a human: {reason}")
 
     @router("proposal_ready")
+    def reflect_on_proposal(self):
+        proposal = self.state.proposal
+        if self._deps.refiner is None or proposal.intent not in REFLECTED_INTENTS:
+            return "reviewed"
+        refiner = self._deps.refiner
+        review = refiner.review_answer if proposal.intent == Intent.ASK else refiner.assess_example
+        try:
+            outcome = run_with_timeout(lambda: review(self.state.clean_text, proposal, self.state.findings),
+                                       self._deps.settings.crew_timeout_seconds)
+        except Exception as e:  # reflection is a quality gate; policy still decides everything
+            self._audit("reflection_failed", error_type=type(e).__name__, error=str(e)[:500])
+            return "reviewed"
+        self.state.reflection = {"score": outcome.score, "accepted": outcome.accepted,
+                                 "stop_reason": outcome.stop_reason, "rounds": outcome.rounds,
+                                 "issues": outcome.issues}
+        self._audit("reflection", intent=proposal.intent.value, **self.state.reflection)
+
+        if proposal.intent == Intent.ASK:
+            if reflection_route(proposal.intent, outcome) == "escalate":
+                self.state.errors.append(f"answer quality below threshold (score {outcome.score:.2f}): "
+                                         + "; ".join(outcome.issues))
+                return "needs_escalation"
+            self.state.proposal = outcome.proposal
+        elif not outcome.accepted and outcome.score is not None:
+            notes = [f"quality review (score {outcome.score:.2f}): {i}" for i in outcome.issues] or \
+                [f"quality review score {outcome.score:.2f} is below the threshold"]
+            self.state.proposal = proposal.model_copy(update={"issues": proposal.issues + notes})
+        return "reviewed"
+
+    @router("reviewed")
     def authorize_proposal(self):
         proposal = self.state.proposal
         decision = authorize(proposal, self.state.role, self._deps.repo,
@@ -219,6 +317,8 @@ class OpsResult:
     intent: str | None
     params: dict  # the final proposal's parameters (empty if there was no valid proposal)
     tool_calls: list[ToolCallRecord]
+    repairs: int = 0          # successful self-corrections
+    reflection: dict | None = None
 
 
 def run_request(deps: FlowDeps, request: str, role: Role, request_id: str | None = None) -> OpsResult:
@@ -229,5 +329,5 @@ def run_request(deps: FlowDeps, request: str, role: Role, request_id: str | None
         correlation_id=s.correlation_id, outcome=s.outcome, message=s.message, data=dict(s.data),
         attempts=s.attempts, errors=list(s.errors), intent=s.proposal.intent.value if s.proposal else None,
         params=s.proposal.params.model_dump(exclude_none=True) if s.proposal else {},
-        tool_calls=list(s.tool_calls),
+        tool_calls=list(s.tool_calls), repairs=s.repairs, reflection=dict(s.reflection) or None,
     )

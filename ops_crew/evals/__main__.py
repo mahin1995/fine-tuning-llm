@@ -24,6 +24,11 @@ def make_deps_factory(settings: OpsSettings, workdir: Path, verbose: bool):
     config = load_config(settings.config_dir)
     llms = ProfileLLMFactory(config, dict(os.environ))
     llms.check()  # fail fast on missing keys instead of 13 escalated cases
+    refiner = None
+    if settings.refine:
+        from ops_crew.refinement import PydanticAIRefiner
+
+        refiner = PydanticAIRefiner.from_config(settings.config_dir, config)
 
     def make_deps(case, approval):
         case_dir = workdir / case.id
@@ -39,6 +44,7 @@ def make_deps_factory(settings: OpsSettings, workdir: Path, verbose: bool):
             approvals=approval,
             audit=AuditLog([JsonlSink(workdir / "audit.jsonl")]),
             settings=settings,
+            refiner=refiner,
         )
 
     return make_deps

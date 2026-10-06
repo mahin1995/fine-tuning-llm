@@ -1,6 +1,7 @@
 """Turn raw crew output into validated Pydantic models, or fail with an exact reason."""
 import json
 import re
+from dataclasses import dataclass, field
 
 from pydantic import BaseModel, ValidationError
 
@@ -55,3 +56,31 @@ def validate_run(run: CrewRun) -> ValidatedRun:
         proposal=parsed["review_proposal"],
         tool_calls=run.tool_calls,
     )
+
+
+@dataclass
+class PartialRun:
+    """Each task output validated on its own, so a broken final proposal can be repaired
+    without discarding a good classification and research."""
+    classification: ClassifiedRequest | None
+    findings: ResearchFindings | None
+    proposal: ActionProposal | None
+    errors: dict[str, str] = field(default_factory=dict)  # task name -> validation error
+
+    @property
+    def context_ok(self) -> bool:
+        return self.classification is not None and self.findings is not None
+
+
+def validate_parts(run: CrewRun) -> PartialRun:
+    parsed, errors = {}, {}
+    for name, schema in TASK_SCHEMAS.items():
+        if name not in run.outputs:
+            errors[name] = f"missing task output: {name}"
+            continue
+        try:
+            parsed[name] = parse_output(run.outputs[name], schema)
+        except OutputValidationError as e:
+            errors[name] = str(e)
+    return PartialRun(parsed.get("classify_request"), parsed.get("research_context"),
+                      parsed.get("review_proposal"), errors)

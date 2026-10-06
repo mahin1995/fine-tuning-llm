@@ -51,6 +51,11 @@ def build_deps(settings: OpsSettings, *, interactive: bool, log_to_stderr: bool,
         "-", "llm_fallback", model=model, error=f"{type(err).__name__}: {err}"[:300]))
     llms.check()
     repo = DatasetRepository(settings.train_data, settings.eval_data)
+    refiner = None
+    if settings.refine:
+        from ops_crew.refinement import PydanticAIRefiner
+
+        refiner = PydanticAIRefiner.from_config(settings.config_dir, config, env)
     return FlowDeps(
         proposer=CrewProposer(config, llms, ReadOnlyDataset(repo), verbose=verbose),
         repo=repo,
@@ -58,6 +63,7 @@ def build_deps(settings: OpsSettings, *, interactive: bool, log_to_stderr: bool,
         approvals=ConsoleApproval() if interactive else DenyAllApprovals(),
         audit=audit,
         settings=settings,
+        refiner=refiner,
     )
 
 
