@@ -1,0 +1,6 @@
+# ops_crew (hybrid CrewAI agent). Kept separate from requirements.txt so it's clear
+# which dependencies belong to the agent layer; the Dockerfile installs both.
+# Verified with `pip check` against the pins in requirements.txt.
+crewai[anthropic]==1.15.23     # [anthropic] enables anthropic/* LLM profiles; OpenAI-compatible needs no extra
+pydantic-settings==2.15.0
+PyYAML==6.0.3

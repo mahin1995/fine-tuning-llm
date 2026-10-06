@@ -1,4 +1,5 @@
-# The project is bind-mounted at run time, so only requirements.txt is COPY'd.
+# The project is bind-mounted at run time, so only the requirements files are COPY'd.
 # Keeping everything else out keeps the build context tiny (no venv, outputs, data).
 *
 !requirements.txt
+!requirements-crew.txt
