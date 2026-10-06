@@ -123,6 +123,13 @@ def test_llms_are_built_with_temperature_zero_and_keys_from_env():
         build_llm(cfg.profiles["openai"], {})
 
 
+def test_factory_check_fails_fast_on_missing_key():
+    cfg = load_config(CONFIG_DIR, env={})
+    ProfileLLMFactory(cfg, {}).check()  # local profile needs no key
+    with pytest.raises(ConfigError, match="set ANTHROPIC_API_KEY"):
+        ProfileLLMFactory(cfg, {"OPS_LLM_PROFILE_REVIEWER": "anthropic"}).check()
+
+
 def test_factory_skips_fallbacks_without_keys():
     cfg = load_config(CONFIG_DIR, env={})
     assert not isinstance(ProfileLLMFactory(cfg, {}).for_agent("classifier"), FallbackLLM)

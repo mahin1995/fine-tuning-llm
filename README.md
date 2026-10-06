@@ -1,4 +1,4 @@
-# Qwen3 fine-tuning harness + tool-calling agent
+# Qwen3 fine-tuning harness + agents
 
 Fine-tune `Qwen/Qwen3-0.6B` on a Java / Spring Boot Q&A dataset, chat with it from
 the terminal or a browser, and run it as a tool-calling agent. Everything runs in
@@ -29,7 +29,17 @@ agent/                    tool-calling agent loop         -> python -m agent
   builtin_tools.py        calculator (safe AST), current_time, search_knowledge_base
   backends/qwen.py        adapter to qwen_ft's ChatModel: the only bridge between the two packages
 
-tests/                    CPU tests with a tiny local Qwen3 model (no download), incl. architecture rules
+ops_crew/                 hybrid CrewAI agent: Dataset Ops Assistant  -> python -m ops_crew "<request>"
+  schemas.py              Pydantic contracts for every crew output
+  settings.py             OPS_* env settings (thresholds, paths, retries, timeouts)
+  config/                 agents.yaml, tasks.yaml, llms.yaml (multi-LLM profiles)
+  domain/                 deterministic layer, plain Python: validation, policy, idempotency,
+                          approval, audit, repository, executor            (no CrewAI)
+  flow.py                 CrewAI Flow: intake -> crew -> validate -> authorize -> approve -> execute
+  crew/                   3-agent sequential crew, read-only tools, LLM factory with fallbacks
+  evals/                  13 golden cases + runner              -> python -m ops_crew.evals
+
+tests/                    CPU tests (tiny local Qwen3 model, scripted LLMs for CrewAI), incl. architecture rules
 ```
 
 ### Dependency rules (enforced by `tests/test_architecture.py`)
@@ -46,7 +56,9 @@ tests/                    CPU tests with a tiny local Qwen3 model (no download),
 | `agent` core (loop, tools, parser, builtin_tools) | nothing from `qwen_ft` |
 | `agent/backends/qwen.py`, `agent/__main__.py` | `qwen_ft` (the only bridge) |
 
-`qwen_ft` never imports `agent`. Lightweight modules (`data`, `config`, `modeling.params`, `evaluation`, `serving.app`,
+`qwen_ft` never imports `agent`. `ops_crew.domain` imports no CrewAI and only reuses
+`qwen_ft.data`; only `ops_crew/crew/`, `flow.py`, `evals/` and `__main__` import CrewAI;
+`qwen_ft`, `agent` and `ops_crew` never import each other sideways. Lightweight modules (`data`, `config`, `modeling.params`, `evaluation`, `serving.app`,
 `training.options`, the CLI dispatcher) must not import torch/transformers; tests check this too.
 
 ## Quick start
@@ -105,6 +117,64 @@ it to `Agent`. The loop doesn't know or care which model is behind it.
 
 A 0.6B model is weak at tool calling out of the box; fine-tuning on tool-call
 examples is the way to make it reliable (see PROCESS.md, next steps).
+
+## Hybrid agent: Dataset Ops Assistant (`ops_crew`)
+
+Natural-language requests about the training data, handled with a strict split:
+**the LLM crew proposes, deterministic code validates, decides and executes.**
+
+| Intent | Example | Side effect | Needs |
+|---|---|---|---|
+| `ask` | "What does REQUIRES_NEW do?" | none | viewer |
+| `dataset_stats` | "How many examples are there?" | none (numbers come from code) | viewer |
+| `add_example` | "Add Q: ... A: ..." | append to `data/train.jsonl` (idempotent) | editor |
+| `remove_example` | "Remove the bean-scope example" | delete one row (atomic write) | admin + human approval |
+
+```
+intake ─► check_input ─┬─ input_invalid ──► reject_input
+                       └─ input_ok ──► propose: crew + Pydantic validation (1 try + 2 retries)
+                                         ├─ needs_escalation ──► escalate (human)
+                                         ├─ low_confidence ────► clarify (question back to user)
+                                         └─ proposal_ready ────► authorize_proposal (policy.py)
+                                                                   ├─ denied ──────────► reject_proposal
+                                                                   ├─ authorized ──────► execute_action ─► audit
+                                                                   └─ approval_required ► request_approval
+                                                                                           ├─ approved ─► execute_action
+                                                                                           └─ declined ─► decline
+```
+
+**Crew** (sequential, `allow_delegation=False`, `temperature=0`, `max_iter` + `max_execution_time` per agent,
+`output_pydantic` on every task):
+Intent Classifier (no tools) -> Dataset Researcher (search, get, duplicate, eval-overlap, stats; all read-only)
+-> Proposal Reviewer (get, duplicate). Sequential because the work is a fixed pipeline; a hierarchical
+manager would add LLM calls and unpredictability for no gain.
+
+**Multi-LLM** (`ops_crew/config/llms.yaml`): profiles `local` (any OpenAI-compatible server: Ollama, vLLM, ...),
+`openai`, `anthropic`, `qwen_ft` (this repo's model, experimental). Per agent:
+`OPS_LLM_PROFILE_<AGENT>` > `OPS_LLM_PROFILE` > `llm:` in agents.yaml. Profiles list `fallbacks` that are tried
+when a provider fails (skipped if their key isn't set). Keys come only from env vars named in the profile.
+
+```bash
+./run.sh python -m ops_crew "How many examples are in the training data?"
+./run.sh python -m ops_crew --role editor "Add Q: What is a Spring profile? A: A named set of beans ..."
+./run.sh python -m ops_crew --role admin "Remove the example about bean scopes"     # asks for approval
+OPS_LLM_PROFILE=openai OPENAI_API_KEY=... ./run.sh python -m ops_crew.evals --report outputs/ops/evals.json
+OPS_LLM_PROFILE_REVIEWER=anthropic ANTHROPIC_API_KEY=... ./run.sh python -m ops_crew "..."   # mix providers
+```
+
+Audit log: `outputs/ops/audit.jsonl` (one JSON record per step, all with the run's correlation id).
+Idempotency store: `outputs/ops/idempotency.jsonl`; pass `--request-id` to scope it explicitly.
+
+| Edge case | Handling |
+|---|---|
+| Invalid JSON / schema violation | Pydantic validation, retry (max 2), then escalate |
+| Hallucinated tool | CrewAI refuses unknown tools; config validation rejects unknown tool names |
+| Hallucinated example id | Policy checks the id exists before anything runs |
+| Agent loop / timeout | `max_iter`, `max_execution_time`, plus a per-attempt crew timeout in the flow |
+| Duplicate submissions / retries | Idempotency key per action; replays return the stored result |
+| Prompt injection | Delimited, neutralised user and tool text; read-only tools; role from caller; markers force approval for side effects |
+| Low confidence | Clarifying question, or escalation if there is none |
+| LLM provider failure | Provider fallback chain, then retry, then escalation; missing keys fail at startup |
 
 ## Key design decisions
 

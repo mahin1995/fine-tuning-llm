@@ -97,6 +97,12 @@ def build_llm(profile: LlmProfile, env: dict) -> BaseLLM:
 
 
 class ProfileLLMFactory:
+    def check(self) -> None:
+        """Build every agent's LLM once so a missing key or bad profile fails at startup,
+        not as a retried crew failure on the first request."""
+        for agent_name in self._config.agents:
+            self.for_agent(agent_name)
+
     def __init__(self, config: CrewConfig, env: dict,
                  on_fallback: Callable[[str, Exception], None] | None = None):
         self._config = config

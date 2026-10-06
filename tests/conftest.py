@@ -7,11 +7,17 @@ turns, <tool_response> for tool results). `python -m qwen_ft download` re-checks
 the real template.
 """
 import json
+import os
 from pathlib import Path
 
 import pytest
 from tokenizers import Regex, Tokenizer, decoders, models, pre_tokenizers, trainers
 from transformers import PreTrainedTokenizerFast, Qwen3Config, Qwen3ForCausalLM
+
+# CrewAI (ops_crew tests): no telemetry or tracing from the test suite.
+for _var, _value in (("CREWAI_DISABLE_TELEMETRY", "true"), ("OTEL_SDK_DISABLED", "true"),
+                     ("CREWAI_TRACING_ENABLED", "false")):
+    os.environ.setdefault(_var, _value)
 
 ROOT = Path(__file__).resolve().parent.parent
 TRAIN_DATA = ROOT / "data" / "train.jsonl"

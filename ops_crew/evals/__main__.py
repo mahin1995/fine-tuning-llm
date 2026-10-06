@@ -23,6 +23,7 @@ def make_deps_factory(settings: OpsSettings, workdir: Path, verbose: bool):
 
     config = load_config(settings.config_dir)
     llms = ProfileLLMFactory(config, dict(os.environ))
+    llms.check()  # fail fast on missing keys instead of 13 escalated cases
 
     def make_deps(case, approval):
         case_dir = workdir / case.id
@@ -52,10 +53,16 @@ def main(argv=None):
     p.add_argument("--verbose", action="store_true", help="print CrewAI agent output")
     args = p.parse_args(argv)
 
+    from ops_crew.crew.config import ConfigError
+
     suite = load_suite(args.cases)
     settings = OpsSettings()
     with tempfile.TemporaryDirectory(prefix="ops-evals-") as tmp:
-        make_deps = make_deps_factory(settings, Path(tmp), args.verbose)
+        try:
+            make_deps = make_deps_factory(settings, Path(tmp), args.verbose)
+        except ConfigError as e:
+            print(f"configuration error: {e}", file=sys.stderr)
+            return 2
         report = run_suite(suite, make_deps, args.threshold, args.case,
                            on_result=lambda r: print(f"{'PASS' if r.passed else 'FAIL'} {r.case_id}", file=sys.stderr))
     print(format_report(report))

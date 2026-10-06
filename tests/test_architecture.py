@@ -77,3 +77,44 @@ def test_only_backends_and_entrypoint_import_qwen_ft():
         if rel.startswith("backends/") or rel == "__main__.py":
             continue
         assert not any(n.split(".")[0] == "qwen_ft" for n in _imports_of(path)), f"agent/{rel} imports qwen_ft"
+
+
+# ------------------------------------------------------------------ ops_crew
+
+OPS_DOMAIN_MODULES = ["ops_crew.schemas", "ops_crew.settings"] + [
+    f"ops_crew.domain.{p.stem}" for p in sorted((ROOT / "ops_crew" / "domain").glob("*.py")) if p.stem != "__init__"
+]
+
+
+def test_ops_deterministic_layer_imports_no_crewai_or_ml_libraries():
+    pytest.importorskip("pydantic_settings")
+    mods = imported_modules(*OPS_DOMAIN_MODULES)
+    assert not {m for m in mods if m.split(".")[0] in ("crewai", "litellm", "openai", "anthropic")}
+    assert not heavy(mods)
+    assert not {m for m in mods if m.startswith(("ops_crew.crew", "ops_crew.flow", "agent"))}
+
+
+def test_only_crew_flow_evals_and_entrypoint_import_crewai():
+    allowed = ("crew/", "flow.py", "evals/", "__main__.py")
+    for path in (ROOT / "ops_crew").rglob("*.py"):
+        rel = path.relative_to(ROOT / "ops_crew").as_posix()
+        if rel.startswith(allowed):
+            continue
+        assert not any(n.split(".")[0] == "crewai" for n in _imports_of(path)), f"ops_crew/{rel} imports crewai"
+
+
+def test_ops_domain_only_reuses_qwen_ft_data():
+    for path in (ROOT / "ops_crew" / "domain").rglob("*.py"):
+        for name in _imports_of(path):
+            parts = name.split(".")
+            if parts[0] == "qwen_ft":
+                assert parts[:2] == ["qwen_ft", "data"], f"{path.name} imports {name}"
+            assert not name.startswith(("ops_crew.crew", "ops_crew.flow", "ops_crew.evals"))
+
+
+def test_packages_do_not_import_each_other_sideways():
+    for package, forbidden in (("qwen_ft", ("ops_crew", "agent")), ("agent", ("ops_crew",)),
+                               ("ops_crew", ("agent",))):
+        for path in (ROOT / package).rglob("*.py"):
+            bad = [n for n in _imports_of(path) if n.split(".")[0] in forbidden]
+            assert not bad, f"{path.relative_to(ROOT)} imports {bad}"

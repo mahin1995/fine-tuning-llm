@@ -244,21 +244,49 @@ since decoding would then strip it.
 transcripts. The data schema would need to accept `tool` messages and assistant
 `tool_calls`, and the training rows would carry a `tools` column, which TRL already reads.
 
+## Step 11 — Hybrid CrewAI agent: Dataset Ops Assistant *(written, tested offline)*
+
+`ops_crew/` handles natural-language requests about the training data: ask, dataset_stats,
+add_example and remove_example. **The LLM proposes, deterministic code decides and executes.**
+
+- **Deterministic layer** (`domain/`, plain Python, no CrewAI):
+  - Pydantic validation of every task output, with 2 retries and then escalation
+  - role- and business-rule policy that reuses `qwen_ft.data` (duplicates, eval leakage,
+    and ids that must exist)
+  - idempotency keys, plus an approval gateway for destructive or suspicious side effects
+  - a JSON audit log with correlation ids
+  - atomic dataset writes
+- **Flow** (`flow.py`): a CrewAI 1.15 Flow with `@start`, `@router` and `@listen`. It only
+  orders the steps; every decision comes from `domain/`.
+- **Crew**: Intent Classifier → Dataset Researcher → Proposal Reviewer, run sequentially,
+  temperature 0, `max_iter` / `max_execution_time` limits, `output_pydantic` on every
+  task, and read-only traced tools.
+- **Multi-LLM**: profiles in `llms.yaml` (local OpenAI-compatible server, OpenAI,
+  Anthropic, in-process qwen_ft), selected per agent with env overrides, with a provider
+  fallback chain. Keys come only from env vars, and missing keys fail at startup.
+- **Verified CrewAI 1.15 behaviour** (by running it, not from docs):
+  - Flows run offline.
+  - A scripted `BaseLLM` can drive real agents and tools.
+  - Unknown tools are refused.
+  - Unparseable output raises `ConverterError`.
+  - A route label that equals a method name is rejected.
+- **Evals:** 13 golden cases (`python -m ops_crew.evals`) with a 0.8 pass threshold. An
+  oracle crew passes all of them in the tests, which shows the expectations are consistent.
+  Not yet run against a real LLM, since none is reachable from the dev container.
+- **Bugs found by tests while building:**
+  1. A resubmitted add was rejected as a "duplicate" before the idempotent replay could run.
+     Fixed with an `already_executed` pass-through for role-checked replays.
+  2. A missing API key surfaced as 3 retried crew failures. Fixed by checking every LLM at startup.
+
 ## Tests
 
-`python -m pytest` runs 126 tests on CPU in about 30s with no network access. They use
-a tiny Qwen3-architecture model built locally (`tests/conftest.py`) whose template
-also covers tool calling. They cover:
-- data validation
-- train/inference template consistency (text and token ids)
-- full and LoRA training, including saving and merging
-- an overfit check that confirms training actually lowers loss
-- loading and generating, including stream stop
-- evaluation end to end
-- the API's validation
-- the agent loop, with a scripted backend, and the agent on the tiny Qwen model
-- parser, tools and calculator safety
-- architecture boundaries
+`python -m pytest` runs 210 tests offline. The ops_crew tests skip themselves
+when `requirements-crew.txt` isn't installed. They cover:
+- **qwen_ft:** data, training (full and LoRA), template consistency, evaluation, serving
+- **agent:** the loop, the parser, tools and calculator safety, Qwen integration
+- **ops_crew:** the domain layer, every flow route with a mocked crew, real CrewAI
+  agents on scripted LLMs, evals with an oracle crew
+- **architecture:** package boundaries
 
 ## Open items / decisions made along the way
 
