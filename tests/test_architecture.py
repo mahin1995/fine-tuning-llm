@@ -118,3 +118,28 @@ def test_packages_do_not_import_each_other_sideways():
         for path in (ROOT / package).rglob("*.py"):
             bad = [n for n in _imports_of(path) if n.split(".")[0] in forbidden]
             assert not bad, f"{path.relative_to(ROOT)} imports {bad}"
+
+
+# ------------------------------------------------------------------- refiner
+
+THIRD_PARTY_OK_FOR_REFINER = {"pydantic", "pydantic_ai"}
+
+
+def test_refiner_depends_only_on_pydantic_ai():
+    import sys as _sys
+
+    stdlib = set(_sys.stdlib_module_names)
+    for path in (ROOT / "refiner").rglob("*.py"):
+        for name in _imports_of(path):
+            top = name.split(".")[0]
+            assert top in stdlib or top in THIRD_PARTY_OK_FOR_REFINER or top == "refiner", \
+                f"{path.relative_to(ROOT)} imports {name}"
+
+
+def test_only_the_ops_crew_adapter_imports_refiner():
+    for package in ("qwen_ft", "agent", "ops_crew"):
+        for path in (ROOT / package).rglob("*.py"):
+            rel = path.relative_to(ROOT).as_posix()
+            if rel == "ops_crew/refinement.py":
+                continue
+            assert not any(n.split(".")[0] == "refiner" for n in _imports_of(path)), f"{rel} imports refiner"

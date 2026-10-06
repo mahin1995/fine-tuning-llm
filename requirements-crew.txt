@@ -4,3 +4,11 @@
 crewai[anthropic]==1.15.23     # [anthropic] enables anthropic/* LLM profiles; OpenAI-compatible needs no extra
 pydantic-settings==2.15.0
 PyYAML==6.0.3
+
+# refiner (self-correction + reflection). Version chosen for compatibility, not recency:
+# - pydantic-ai 2.x needs openai>=3, but crewai 1.15 requires openai<3 (unresolvable)
+# - pydantic-ai <=1.2x imports opentelemetry._events, removed in the opentelemetry-api 1.45 crewai pulls in
+#   (pip check does not catch it; the import crashes)
+# - the [anthropic] extra needs anthropic>=0.75 while crewai[anthropic] pins 0.73, so refiner
+#   uses OpenAI-compatible endpoints (local servers, Ollama, OpenAI) only
+pydantic-ai-slim[openai]==1.107.7
