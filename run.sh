@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Usage:
-#   ./run.sh build                           build the qwen-ft image
-#   ./run.sh python train.py                 run a command inside the container
-#   ./run.sh bash                            interactive shell
-#   PORT=8000 ./run.sh python serve.py       also publish a port (on 127.0.0.1 only)
-#   nohup ./run.sh python train.py > train.log 2>&1 &   works too (no TTY needed)
+#   ./run.sh build                                   build the qwen-ft image
+#   ./run.sh python -m qwen_ft train                 run a command inside the container
+#   ./run.sh python -m agent "What is 17 * 23?"      run the tool-calling agent
+#   ./run.sh bash                                    interactive shell
+#   PORT=8000 ./run.sh python -m qwen_ft serve       also publish a port (on 127.0.0.1 only)
+#   nohup ./run.sh python -m qwen_ft train > train.log 2>&1 &   works too (no TTY needed)
 set -euo pipefail
 
 cd "$(dirname "$0")"

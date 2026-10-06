@@ -1,15 +1,16 @@
 """Interactive terminal chat with a base or fine-tuned model.
 
-    python chat.py                         # outputs/qwen3-ft
-    python chat.py --model Qwen/Qwen3-0.6B # compare with the base model
-    python chat.py --system "You are a senior Java interviewer."
+    python -m qwen_ft chat                          # outputs/qwen3-ft
+    python -m qwen_ft chat --model Qwen/Qwen3-0.6B  # compare with the base model
+    python -m qwen_ft chat --system "You are a senior Java interviewer."
 
 Commands: /reset clears history, /exit (or Ctrl-D) quits.
 """
 import argparse
 import sys
 
-from inference import ChatModel, GenerationParams
+from qwen_ft.config import DEFAULT_OUTPUT_DIR
+from qwen_ft.modeling.params import GenerationParams
 
 
 def trim_history(history, max_turns):
@@ -20,13 +21,16 @@ def trim_history(history, max_turns):
 
 
 def main(argv=None):
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--model", default="outputs/qwen3-ft")
+    p = argparse.ArgumentParser(prog="python -m qwen_ft chat", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--model", default=DEFAULT_OUTPUT_DIR)
     p.add_argument("--system", default=None, help="optional system prompt")
     p.add_argument("--max-new-tokens", type=int, default=512)
     p.add_argument("--temperature", type=float, default=0.7, help="0 = greedy")
     p.add_argument("--max-turns", type=int, default=8, help="history turns kept in the prompt")
     args = p.parse_args(argv)
+
+    from qwen_ft.modeling.chat_model import ChatModel
 
     print(f"loading {args.model} ...")
     chat = ChatModel.load(args.model)

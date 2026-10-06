@@ -3,19 +3,24 @@ import json
 
 import pytest
 
-import evaluate
-import train
-from chat import trim_history
-from conftest import ROOT
-from data_utils import CHAT_TEMPLATE_KWARGS, load_conversations
-from inference import ChatModel, GenerationParams, is_adapter_dir
+from conftest import EVAL_DATA, TRAIN_DATA
+from qwen_ft.cli import evaluate as evaluate_cli
+from qwen_ft.cli import train as train_cli
+from qwen_ft.cli.chat import trim_history
+from qwen_ft.config import CHAT_TEMPLATE_KWARGS
+from qwen_ft.data.io import load_conversations
+from qwen_ft.modeling.chat_model import ChatModel
+from qwen_ft.modeling.loading import is_adapter_dir
+from qwen_ft.modeling.params import GenerationParams
+from qwen_ft.training.options import LoraOptions, TrainOptions
+from qwen_ft.training.trainer import run_training
 
 GREEDY_SHORT = GenerationParams(temperature=0.0, max_new_tokens=8)
 
 
 def test_inference_prompt_is_prefix_of_training_example(tokenizer):
     """The core train/inference consistency guarantee, in text and token ids."""
-    for messages in load_conversations(ROOT / "data.jsonl"):
+    for messages in load_conversations(TRAIN_DATA):
         prompt = tokenizer.apply_chat_template(messages[:-1], tokenize=False, add_generation_prompt=True,
                                                **CHAT_TEMPLATE_KWARGS)
         full = tokenizer.apply_chat_template(messages, tokenize=False, **CHAT_TEMPLATE_KWARGS)
@@ -27,21 +32,21 @@ def test_inference_prompt_is_prefix_of_training_example(tokenizer):
 
 
 def common_args(model_dir, out):
-    return ["--model", str(model_dir), "--output", str(out), "--epochs", "1",
+    return ["--model", str(model_dir), "--data", str(TRAIN_DATA), "--output", str(out), "--epochs", "1",
             "--batch-size", "2", "--grad-accum", "1", "--max-length", "256"]
 
 
 @pytest.fixture(scope="module")
 def full_ft_dir(tiny_model_dir, tmp_path_factory):
     out = tmp_path_factory.mktemp("full")
-    assert train.main(common_args(tiny_model_dir, out) + ["--eval-ratio", "0.2"]) == 0
+    assert train_cli.main(common_args(tiny_model_dir, out) + ["--eval-ratio", "0.2"]) == 0
     return out
 
 
 @pytest.fixture(scope="module")
 def lora_dir(tiny_model_dir, tmp_path_factory):
     out = tmp_path_factory.mktemp("lora")
-    assert train.main(common_args(tiny_model_dir, out) + ["--lora", "--lora-r", "4", "--merge"]) == 0
+    assert train_cli.main(common_args(tiny_model_dir, out) + ["--lora", "--lora-r", "4", "--merge"]) == 0
     return out
 
 
@@ -50,6 +55,7 @@ def test_full_finetune_saves_model_and_run_info(full_ft_dir, tiny_model_dir):
     assert (full_ft_dir / "tokenizer_config.json").is_file()
     info = json.loads((full_ft_dir / "run_info.json").read_text())
     assert info["method"] == "full"
+    assert info["options"]["lora"] is None
     assert info["base_model"] == str(tiny_model_dir)
     assert "eval_loss" in info["metrics"] and "train_loss" in info["metrics"]
 
@@ -83,35 +89,58 @@ def test_stream_can_be_stopped_early(tiny_model_dir):
 
 def test_training_actually_reduces_answer_loss(tiny_model_dir, tmp_path):
     """Overfit the tiny model: loss on a training answer must go down."""
-    conversation = load_conversations(ROOT / "data.jsonl")[0]
+    conversation = load_conversations(TRAIN_DATA)[0]
     prompt, answer = conversation[:-1], conversation[-1]["content"]
     before = ChatModel.load(tiny_model_dir, device="cpu").completion_loss(prompt, answer)
 
     out = tmp_path / "overfit"
     args = common_args(tiny_model_dir, out)
     args[args.index("--epochs") + 1] = "5"
-    assert train.main(args + ["--lr", "5e-3", "--warmup-ratio", "0"]) == 0
+    assert train_cli.main(args + ["--lr", "5e-3", "--warmup-ratio", "0"]) == 0
     after = ChatModel.load(out, device="cpu").completion_loss(prompt, answer)
     assert after < before * 0.9
 
 
 def test_evaluate_writes_report(full_ft_dir, tmp_path):
     report = tmp_path / "report.md"
-    assert evaluate.main(["--model", str(full_ft_dir), "--eval-data", str(ROOT / "eval.jsonl"),
+    assert evaluate_cli.main(["--model", str(full_ft_dir), "--eval-data", str(EVAL_DATA),
                           "--report", str(report), "--max-new-tokens", "4"]) == 0
     text = report.read_text()
     assert "Mean answer loss" in text
-    assert text.count("**Fine-tuned**") == len(load_conversations(ROOT / "eval.jsonl"))
+    assert text.count("**Fine-tuned**") == len(load_conversations(EVAL_DATA))
 
 
 def test_merge_requires_lora():
     with pytest.raises(SystemExit):
-        train.parse_args(["--merge"])
+        train_cli.parse_options(["--merge"])
+
+
+def test_cli_maps_to_options():
+    opts = train_cli.parse_options(["--lora", "--lora-r", "8", "--merge", "--epochs", "2"])
+    assert opts.lora == LoraOptions(r=8, merge=True)
+    assert opts.epochs == 2 and opts.method == "lora"
+    assert train_cli.parse_options([]).lora is None
 
 
 def test_default_learning_rates():
-    assert train.parse_args([]).lr == 2e-5
-    assert train.parse_args(["--lora"]).lr == 2e-4
+    assert TrainOptions().lr == 2e-5
+    assert TrainOptions(lora=LoraOptions()).lr == 2e-4
+    assert TrainOptions(lr=1e-3).lr == 1e-3
+
+
+@pytest.mark.parametrize("kwargs", [{"warmup_ratio": 1.0}, {"eval_ratio": -0.1}, {"batch_size": 0}])
+def test_invalid_options_rejected(kwargs):
+    with pytest.raises(ValueError):
+        TrainOptions(**kwargs)
+
+
+def test_run_training_can_be_called_without_cli(tiny_model_dir, tmp_path):
+    """Training logic is usable from code (notebooks, other tools) with no argparse involved."""
+    result = run_training(TrainOptions(model=str(tiny_model_dir), data=str(TRAIN_DATA), output=str(tmp_path),
+                                       epochs=1, batch_size=4, grad_accum=1, max_length=256))
+    assert result.output_dir == str(tmp_path)
+    assert result.optimizer_steps == 3  # ceil(10 / 4)
+    assert "train_loss" in result.metrics
 
 
 def test_trim_history_keeps_system_and_recent_pairs():

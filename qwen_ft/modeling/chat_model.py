@@ -1,55 +1,16 @@
-"""Shared model loading and chat generation for evaluate.py, chat.py and serve.py.
-
-Works with three kinds of model paths:
-- a Hub id or a full checkpoint directory (full fine-tuning output)
-- a LoRA adapter directory (contains adapter_config.json); merged on load
-"""
+"""Chat generation that renders prompts exactly as training did."""
 import threading
-from dataclasses import dataclass
-from pathlib import Path
 
 import torch
-from transformers import (
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    StoppingCriteria,
-    StoppingCriteriaList,
-    TextIteratorStreamer,
-)
+from transformers import StoppingCriteria, StoppingCriteriaList, TextIteratorStreamer
 
-from data_utils import CHAT_TEMPLATE_KWARGS
-
-DEFAULT_BASE_MODEL = "Qwen/Qwen3-0.6B"
-
-
-@dataclass(frozen=True)
-class GenerationParams:
-    # Qwen3 recommended sampling for non-thinking mode. temperature=0 means greedy.
-    max_new_tokens: int = 512
-    temperature: float = 0.7
-    top_p: float = 0.8
-    top_k: int = 20
-    repetition_penalty: float = 1.05
-
-    def to_generate_kwargs(self):
-        if self.temperature <= 0:
-            return {"max_new_tokens": self.max_new_tokens, "do_sample": False,
-                    "repetition_penalty": self.repetition_penalty}
-        return {
-            "max_new_tokens": self.max_new_tokens,
-            "do_sample": True,
-            "temperature": self.temperature,
-            "top_p": self.top_p,
-            "top_k": self.top_k,
-            "repetition_penalty": self.repetition_penalty,
-        }
-
-
-GREEDY = GenerationParams(temperature=0.0)
+from qwen_ft.config import CHAT_TEMPLATE_KWARGS
+from qwen_ft.modeling.loading import load_model_and_tokenizer
+from qwen_ft.modeling.params import GenerationParams
 
 
 class _StopOnEvent(StoppingCriteria):
-    """Lets the consumer of stream() abort generation early (e.g. Ctrl-C in chat.py)."""
+    """Lets the consumer of stream() abort generation early (e.g. Ctrl-C in the chat CLI)."""
 
     def __init__(self, event):
         self.event = event
@@ -58,39 +19,12 @@ class _StopOnEvent(StoppingCriteria):
         return self.event.is_set()
 
 
-def pick_device():
-    return "cuda" if torch.cuda.is_available() else "cpu"
-
-
-def inference_dtype(device):
-    # bf16 halves memory on GPU; on CPU bf16 matmuls are slow, so stay in fp32.
-    if device == "cuda" and torch.cuda.is_bf16_supported():
-        return torch.bfloat16
-    return torch.float32
-
-
-def is_adapter_dir(model_path):
-    return (Path(model_path) / "adapter_config.json").is_file()
-
-
-def load_model_and_tokenizer(model_path, device=None):
-    device = device or pick_device()
-    dtype = inference_dtype(device)
-    if is_adapter_dir(model_path):
-        from peft import AutoPeftModelForCausalLM
-
-        model = AutoPeftModelForCausalLM.from_pretrained(model_path, dtype=dtype)
-        model = model.merge_and_unload()  # plain model: faster generation, no peft overhead
-    else:
-        model = AutoModelForCausalLM.from_pretrained(model_path, dtype=dtype)
-    # train.py saves the tokenizer next to the weights/adapter, so this works for all three cases.
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
-    model.to(device).eval()
-    return model, tokenizer
-
-
 class ChatModel:
-    """Thin wrapper that applies the chat template consistently with training."""
+    """Thin wrapper that applies the chat template consistently with training.
+
+    `tools` (optional, OpenAI-style function schemas) is passed through to the chat
+    template, which is how tool-calling agents describe the available tools.
+    """
 
     def __init__(self, model, tokenizer, name="model"):
         self.model = model
@@ -108,9 +42,10 @@ class ChatModel:
     def device(self):
         return self.model.device
 
-    def build_inputs(self, messages):
+    def build_inputs(self, messages, tools=None):
         return self.tokenizer.apply_chat_template(
             messages,
+            tools=tools,
             add_generation_prompt=True,
             return_tensors="pt",
             return_dict=True,
@@ -126,16 +61,16 @@ class ChatModel:
         }
 
     @torch.inference_mode()
-    def generate(self, messages, params=GenerationParams()):
-        inputs = self.build_inputs(messages)
+    def generate(self, messages, params=GenerationParams(), tools=None):
+        inputs = self.build_inputs(messages, tools)
         with self._lock:
             output = self.model.generate(**self._generate_kwargs(inputs, params))
         new_tokens = output[0, inputs["input_ids"].shape[1]:]
         return self.tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
 
-    def stream(self, messages, params=GenerationParams()):
-        """Yield text chunks as they are generated (used by chat.py)."""
-        inputs = self.build_inputs(messages)
+    def stream(self, messages, params=GenerationParams(), tools=None):
+        """Yield text chunks as they are generated."""
+        inputs = self.build_inputs(messages, tools)
         streamer = TextIteratorStreamer(self.tokenizer, skip_prompt=True, skip_special_tokens=True)
         stop = threading.Event()
         kwargs = {

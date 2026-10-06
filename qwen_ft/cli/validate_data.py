@@ -1,7 +1,7 @@
 """Validate chat datasets before training and print basic statistics.
 
-    python validate_data.py                         # data.jsonl and eval.jsonl
-    python validate_data.py data.jsonl --tokenizer Qwen/Qwen3-0.6B --max-length 1024
+    python -m qwen_ft validate                      # data/train.jsonl and data/eval.jsonl
+    python -m qwen_ft validate data/train.jsonl --tokenizer Qwen/Qwen3-0.6B --max-length 1024
 
 Checks: valid JSON, chat structure (roles alternate, ends with assistant), no
 duplicate questions, and no question shared between train and eval files.
@@ -11,11 +11,10 @@ import argparse
 import statistics
 import sys
 
-from data_utils import CHAT_TEMPLATE_KWARGS, DataError, load_conversations
-
-
-def question_of(messages):
-    return messages[-2]["content"].strip().lower()
+from qwen_ft.config import CHAT_TEMPLATE_KWARGS, DEFAULT_EVAL_DATA, DEFAULT_TRAIN_DATA
+from qwen_ft.data.io import load_conversations
+from qwen_ft.data.schema import DataError
+from qwen_ft.data.transforms import question_of
 
 
 def token_lengths(conversations, tokenizer_name):
@@ -29,8 +28,9 @@ def token_lengths(conversations, tokenizer_name):
 
 
 def main(argv=None):
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("files", nargs="*", default=["data.jsonl", "eval.jsonl"])
+    p = argparse.ArgumentParser(prog="python -m qwen_ft validate", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("files", nargs="*", default=[DEFAULT_TRAIN_DATA, DEFAULT_EVAL_DATA])
     p.add_argument("--tokenizer", default=None, help="also report token lengths using this tokenizer")
     p.add_argument("--max-length", type=int, default=1024)
     args = p.parse_args(argv)

@@ -72,7 +72,7 @@ disposable and nothing else depends on its system Python.
   the project aren't root-owned.
 - Falls back to `sudo docker` automatically if the `docker` group isn't active
   in the current shell yet.
-- Uses `-it` only when a terminal is attached, so `nohup ./run.sh python train.py &` works.
+- Uses `-it` only when a terminal is attached, so `nohup ./run.sh python -m qwen_ft train &` works.
 - Publishes a port only when `PORT=...` is set, bound to `127.0.0.1`, so training
   and a debug shell can run side by side.
 - Sets `USER` for libraries that look up the user name (the mapped uid has no passwd entry).
@@ -81,7 +81,7 @@ disposable and nothing else depends on its system Python.
 ./run.sh build                      # build the qwen-ft image
 ./run.sh python ...                 # run a command inside it
 ./run.sh bash                       # interactive shell
-PORT=8000 ./run.sh python serve.py  # with a published port
+PORT=8000 ./run.sh python -m qwen_ft serve  # with a published port
 ```
 
 **Verified** — all libraries import correctly, and torch is still the CUDA
@@ -97,7 +97,7 @@ bitsandbytes 0.50.2
 
 ## Step 2 — Dataset
 
-[data.jsonl](data.jsonl) — 10 example Q&A pairs in Qwen chat format:
+[data/train.jsonl](data/train.jsonl) (originally `data.jsonl`) — 10 example Q&A pairs in Qwen chat format:
 ```json
 {"messages": [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}]}
 ```
@@ -108,12 +108,12 @@ field injection, global exception handling, auto-configuration, JPA fetch
 types, self-invocation proxy pitfall, rollback-on-checked-exceptions).
 
 **Validated:** all 10 lines are valid JSON with the expected `user`/`assistant`
-role structure. `validate_data.py` now checks this automatically, along with
+role structure. `python -m qwen_ft validate` now checks this automatically, along with
 duplicates and train/eval leakage. With `--tokenizer` it also reports token lengths.
 
-[eval.jsonl](eval.jsonl) holds 8 held-out Q&A pairs on topics not in the training
+[data/eval.jsonl](data/eval.jsonl) holds 8 held-out Q&A pairs on topics not in the training
 set (open-in-view, optimistic locking, `getReferenceById`, NESTED propagation, …),
-used by `evaluate.py`.
+used by `python -m qwen_ft evaluate`.
 
 **Note on dataset size:** 10 examples is only enough to smoke-test the
 pipeline. Training 3 epochs on this will make the model memorize these exact
@@ -136,14 +136,14 @@ Checked the HF Hub API for both candidate models before downloading:
 Ollama-only), so it's the model used — no need to fall back to
 Qwen2.5-0.5B-Instruct.
 
-[download_model.py](download_model.py) downloads model + tokenizer via
+[qwen_ft/cli/download_model.py](qwen_ft/cli/download_model.py) downloads model + tokenizer via
 `from_pretrained()`, loads weights in bf16, and prints:
 - parameter count and bf16 memory footprint
 - HF cache location and size on disk
 - the Qwen chat template rendering (sanity check before training)
 
 ```bash
-./run.sh python download_model.py
+./run.sh python -m qwen_ft download
 ```
 
 It also asserts that pad != eos and that the inference prompt
@@ -154,7 +154,7 @@ training format. That check runs against the real Qwen3 template.
 
 ## Step 4 — Training Script *(written, tested on CPU)*
 
-[train.py](train.py) uses TRL `SFTTrainer` and was checked against the installed
+[qwen_ft/training/trainer.py](qwen_ft/training/trainer.py) uses TRL `SFTTrainer` and was checked against the installed
 `transformers 5.17` / `trl 1.13` source:
 - Data is converted to **prompt-completion** format, so loss is only on the final
   assistant answer. `assistant_only_loss` needs `{% generation %}` markers that
@@ -175,13 +175,13 @@ training format. That check runs against the real Qwen3 template.
 ## Step 5 — Training Run *(not started — needs the GPU host)*
 
 ```bash
-./run.sh python train.py --epochs 10 --batch-size 2 --grad-accum 1   # smoke test, 10 examples
-nohup ./run.sh python train.py > train.log 2>&1 &                    # real run
+./run.sh python -m qwen_ft train --epochs 10 --batch-size 2 --grad-accum 1   # smoke test, 10 examples
+nohup ./run.sh python -m qwen_ft train > train.log 2>&1 &                    # real run
 ```
 
 ## Step 6 — Evaluation *(written, tested on CPU)*
 
-[evaluate.py](evaluate.py) loads the base and fine-tuned models one at a time and,
+[qwen_ft/evaluation/](qwen_ft/evaluation/) loads the base and fine-tuned models one at a time and,
 for each `eval.jsonl` example, records:
 - the **answer loss**: mean NLL of the reference answer, lower is better
 - the greedy answer from each model
@@ -190,31 +190,75 @@ It writes `outputs/qwen3-ft/eval_report.md`.
 
 ## Step 7 — Chat CLI *(written, tested on CPU)*
 
-- [inference.py](inference.py) holds the shared loading code (full model or LoRA
+- [qwen_ft/modeling/](qwen_ft/modeling/) holds the shared loading code (full model or LoRA
   adapter, merged on load) and generation (Qwen3 non-thinking sampling defaults,
   streaming, early stop).
-- [chat.py](chat.py) is an interactive chat with streaming output, `/reset`,
+- [qwen_ft/cli/chat.py](qwen_ft/cli/chat.py) is an interactive chat with streaming output, `/reset`,
   `/exit`, `--system` and bounded history.
 
 ## Step 8 — Chat API + Web UI *(written, tested on CPU)*
 
-[serve.py](serve.py) is a FastAPI app with `GET /`
-([static/index.html](static/index.html)), `GET /health` and `POST /chat`. Requests
+[qwen_ft/serving/app.py](qwen_ft/serving/app.py) is a FastAPI app with `GET /`
+([qwen_ft/serving/static/index.html](qwen_ft/serving/static/index.html)), `GET /health` and `POST /chat`. Requests
 are validated with the same rules as the training data, plus limits on message
 count, content length, `max_new_tokens` and temperature. Generation runs in a
 worker thread behind a lock, so the single GPU model is never called concurrently.
 
+## Step 9 — Package restructure *(done)*
+
+The flat scripts were split into two top-level packages with enforced boundaries
+(see README "Project layout" for the full tree):
+- `qwen_ft/` holds config, data, modeling, training, evaluation, serving and cli.
+  Commands run as `python -m qwen_ft <command>`.
+- Data moved to `data/train.jsonl` and `data/eval.jsonl`.
+- Training logic takes a `TrainOptions` dataclass instead of argparse args, so it can
+  be called from code. The evaluator receives a model loader and the server receives
+  a model factory, so neither depends on how models are loaded.
+- `tests/test_architecture.py` fails if a light module imports torch or a package
+  imports a layer it shouldn't. Planting violations on purpose confirmed that it
+  catches them.
+
+## Step 10 — Agent loop *(written, tested on CPU)*
+
+`agent/` is a model-agnostic tool-calling loop:
+- `Agent.run()` asks the model, parses `<tool_call>{json}</tool_call>`, runs the tools,
+  feeds the results back as `tool` messages, and repeats until the model answers
+  without a tool call or `max_steps` is reached.
+- `ToolRegistry` builds JSON schemas from type hints and validates the model's
+  arguments before running anything.
+- Errors (unknown tool, bad arguments, tool exception, malformed JSON) go back to the
+  model as text instead of crashing the loop. Identical repeated calls are not
+  re-executed, and tool output is truncated.
+- Built-in tools have no side effects: a safe AST calculator (no `eval`, with limits on
+  exponents and result size), `current_time`, and a keyword search over the training Q&A.
+- `agent/backends/qwen.py` adapts `ChatModel`, whose `generate(..., tools=)` passes the
+  schemas to the chat template, still with `enable_thinking=False`.
+- CLI: `python -m agent [--model ...] ["question"]`; leave out the question for interactive mode.
+
+**Caveat:** the real Qwen3-0.6B tool-calling behaviour has not been checked here (no
+network access to Hugging Face). The test template mirrors Qwen3's tool format, and
+`QwenBackend` warns if the real tokenizer treats `<tool_call>` as a special token,
+since decoding would then strip it.
+
+**Next step:** to make a 0.6B model reliable at tool calling, fine-tune it on tool-call
+transcripts. The data schema would need to accept `tool` messages and assistant
+`tool_calls`, and the training rows would carry a `tools` column, which TRL already reads.
+
 ## Tests
 
-`python -m pytest` runs 42 tests on CPU in about 5s with no network access. They use
-a tiny Qwen3-architecture model built locally (`tests/conftest.py`) and cover:
+`python -m pytest` runs 126 tests on CPU in about 30s with no network access. They use
+a tiny Qwen3-architecture model built locally (`tests/conftest.py`) whose template
+also covers tool calling. They cover:
 - data validation
 - train/inference template consistency (text and token ids)
 - full and LoRA training, including saving and merging
 - an overfit check that confirms training actually lowers loss
 - loading and generating, including stream stop
-- `evaluate.py` end to end
+- evaluation end to end
 - the API's validation
+- the agent loop, with a scripted backend, and the agent on the tiny Qwen model
+- parser, tools and calculator safety
+- architecture boundaries
 
 ## Open items / decisions made along the way
 

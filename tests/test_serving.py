@@ -1,7 +1,7 @@
 import pytest
 from fastapi.testclient import TestClient
 
-from serve import create_app
+from qwen_ft.serving.app import create_app
 
 
 class FakeChat:

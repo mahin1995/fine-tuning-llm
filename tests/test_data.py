@@ -2,15 +2,11 @@ import json
 
 import pytest
 
-from data_utils import (
-    CHAT_TEMPLATE_KWARGS,
-    DataError,
-    load_conversations,
-    to_prompt_completion,
-    train_eval_split,
-    validate_messages,
-)
-from conftest import ROOT
+from conftest import EVAL_DATA, TRAIN_DATA
+from qwen_ft.config import CHAT_TEMPLATE_KWARGS
+from qwen_ft.data.io import load_conversations
+from qwen_ft.data.schema import DataError, validate_messages, validate_prompt
+from qwen_ft.data.transforms import to_prompt_completion, train_eval_split
 
 U = {"role": "user", "content": "q"}
 A = {"role": "assistant", "content": "a"}
@@ -62,8 +58,15 @@ def test_load_rejects_empty_file(tmp_path):
 
 
 def test_repo_datasets_are_valid():
-    assert len(load_conversations(ROOT / "data.jsonl")) >= 1
-    assert len(load_conversations(ROOT / "eval.jsonl")) >= 1
+    assert len(load_conversations(TRAIN_DATA)) >= 1
+    assert len(load_conversations(EVAL_DATA)) >= 1
+
+
+def test_validate_prompt_requires_user_last():
+    validate_prompt([U])
+    validate_prompt([S, U, A, U])
+    with pytest.raises(DataError):
+        validate_prompt([U, A])
 
 
 def test_to_prompt_completion_splits_last_turn():
