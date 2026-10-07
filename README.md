@@ -3,6 +3,7 @@
 Fine-tune `Qwen/Qwen3-0.6B` on a Java / Spring Boot Q&A dataset, chat with it from
 the terminal or a browser, and run it as a tool-calling agent. Everything runs in
 Docker on a single NVIDIA GPU (tested target: RTX 3060 12GB). See
+[ARCHITECTURE.md](ARCHITECTURE.md) for the component design and dependency rules,
 [ROADMAP.md](ROADMAP.md) for the goal, feature summary and learning-level progress,
 [PROCESS.md](PROCESS.md) for the full log and the reasoning behind each decision.
 
