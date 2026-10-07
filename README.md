@@ -17,10 +17,12 @@ data/                       datasets (chat format, one JSON object per line)
   eval.jsonl                held-out questions with reference answers (never trained on)
 
 finetune/                   CORE: data -> train -> evaluate      -> python -m finetune <command>
-  config.py                 shared constants (base model, paths, CHAT_TEMPLATE_KWARGS)
+  config.py                 shared constants (default model, paths)
+  model_profiles.yaml       per-model-family settings: chat_template_kwargs, LoRA target layers
+  profiles.py               resolve_profile(model id / dir) -> ModelProfile
   data/                     schema validation, JSONL loading, prompt-completion + split   (no torch)
   modeling/                 params (GenerationParams), loading (full / LoRA), chat_model (ChatModel)
-  training/                 options (TrainOptions dataclass), trainer (run_training)
+  training/                 options (TrainOptions), engine (TrainingEngine port + registry), trl_engine
   evaluation/               evaluator (model loader injected), report (markdown)
   serving/                  app (FastAPI, model injected) + static/index.html   (moves to apps/chat_ui)
   cli/                      one module per command; the only place that wires packages together
@@ -216,14 +218,34 @@ crew proposal ─► validate each task output ─► correctable problem? ─ye
 - PydanticAI is pinned to 1.107.7 for compatibility with CrewAI 1.15, and Anthropic profiles
   aren't available to the refiner; see `apps/requirements.txt` for the reasons.
 
+## Model profiles and training engines
+
+```bash
+python -m finetune download meta-llama/Llama-3.2-1B-Instruct   # prints the resolved profile
+python -m finetune train --model meta-llama/Llama-3.2-1B-Instruct --lora   # profile: llama
+python -m finetune train --profile qwen3 --model ./my-local-model           # force a profile
+python -m finetune train --engine trl                                        # engine registry
+```
+
+- `finetune/model_profiles.yaml` holds what differs per model family. Lookup order: the
+  `profile` in a trained model's `run_info.json`, then a LoRA adapter's base model, then
+  `model_type` in a local `config.json`, then the Hub id pattern, then `default`
+  (`all-linear` LoRA targets, no template variables).
+- `finetune/training/engine.py` is the port: `TrainingEngine.train(options, profile)`. TRL is
+  the only engine today. A new one (e.g. Unsloth) is a class plus one line in `ENGINES`.
+  Profile resolution and the `run_info.json` artifact contract are shared, so every engine
+  produces artifacts that evaluation and serving read the same way.
+
 ## Key design decisions
 
 - **Prompt-completion training.** Only the final assistant answer contributes to
   the loss. Qwen3's template has no `{% generation %}` markers, so TRL's
   `assistant_only_loss` can't be used; splitting into prompt/completion gives the
   same effect.
-- **`enable_thinking=False` everywhere** (`finetune.config.CHAT_TEMPLATE_KWARGS`).
-  Training, inference and the agent use the same setting so the formats match.
+- **Model profiles** (`finetune/model_profiles.yaml`): chat template variables (Qwen3:
+  `enable_thinking=False`) and LoRA target layers per model family, resolved from the model id or
+  directory and recorded in `run_info.json`. Training, inference and the agents all use the
+  resolved profile, so the prompt format always matches. Another model family = a YAML entry, not code.
 - **Full FT loads fp32 weights + bf16 autocast.** Pure-bf16 weights would round
   small updates away. 8-bit AdamW keeps it inside 12GB VRAM.
 - **Dependency injection at the edges.** Training takes a `TrainOptions` dataclass

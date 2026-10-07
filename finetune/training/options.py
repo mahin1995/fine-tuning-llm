@@ -3,16 +3,13 @@ from dataclasses import dataclass
 
 from finetune.config import DEFAULT_BASE_MODEL, DEFAULT_OUTPUT_DIR, DEFAULT_TRAIN_DATA
 
-LORA_TARGET_MODULES = ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj")
-
-
 @dataclass
 class LoraOptions:
     r: int = 16
     alpha: int = 32
     dropout: float = 0.05
     merge: bool = False  # also save a merged full model to <output>/merged
-    target_modules: tuple = LORA_TARGET_MODULES
+    target_modules: tuple | str | None = None  # None: from the model profile (model_profiles.yaml)
 
 
 @dataclass
@@ -31,6 +28,7 @@ class TrainOptions:
     save_checkpoints: bool = False
     gradient_checkpointing: bool = True
     lora: LoraOptions | None = None  # None = full fine-tuning
+    profile: str | None = None       # model profile name; None: resolved from `model`
 
     def __post_init__(self):
         if self.lr is None:

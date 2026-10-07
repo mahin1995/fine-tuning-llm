@@ -7,23 +7,24 @@ from conftest import EVAL_DATA, TRAIN_DATA
 from finetune.cli import evaluate as evaluate_cli
 from finetune.cli import train as train_cli
 from finetune.cli.chat import trim_history
-from finetune.config import CHAT_TEMPLATE_KWARGS
+from finetune.profiles import resolve_profile
 from finetune.data.io import load_conversations
 from finetune.modeling.chat_model import ChatModel
 from finetune.modeling.loading import is_adapter_dir
 from finetune.modeling.params import GenerationParams
 from finetune.training.options import LoraOptions, TrainOptions
-from finetune.training.trainer import run_training
+from finetune.training.engine import run_training
 
 GREEDY_SHORT = GenerationParams(temperature=0.0, max_new_tokens=8)
 
 
-def test_inference_prompt_is_prefix_of_training_example(tokenizer):
+def test_inference_prompt_is_prefix_of_training_example(tokenizer, tiny_model_dir):
     """The core train/inference consistency guarantee, in text and token ids."""
+    kwargs = resolve_profile(str(tiny_model_dir)).chat_template_kwargs
+    assert kwargs == {"enable_thinking": False}  # resolved from config.json model_type=qwen3
     for messages in load_conversations(TRAIN_DATA):
-        prompt = tokenizer.apply_chat_template(messages[:-1], tokenize=False, add_generation_prompt=True,
-                                               **CHAT_TEMPLATE_KWARGS)
-        full = tokenizer.apply_chat_template(messages, tokenize=False, **CHAT_TEMPLATE_KWARGS)
+        prompt = tokenizer.apply_chat_template(messages[:-1], tokenize=False, add_generation_prompt=True, **kwargs)
+        full = tokenizer.apply_chat_template(messages, tokenize=False, **kwargs)
         assert full.startswith(prompt)
         assert prompt.endswith("<think>\n\n</think>\n\n")
         prompt_ids = tokenizer(prompt, add_special_tokens=False)["input_ids"]
@@ -55,6 +56,8 @@ def test_full_finetune_saves_model_and_run_info(full_ft_dir, tiny_model_dir):
     assert (full_ft_dir / "tokenizer_config.json").is_file()
     info = json.loads((full_ft_dir / "run_info.json").read_text())
     assert info["method"] == "full"
+    assert (info["engine"], info["profile"]) == ("trl", "qwen3")
+    assert info["chat_template_kwargs"] == {"enable_thinking": False}
     assert info["options"]["lora"] is None
     assert info["base_model"] == str(tiny_model_dir)
     assert "eval_loss" in info["metrics"] and "train_loss" in info["metrics"]
@@ -141,6 +144,7 @@ def test_run_training_can_be_called_without_cli(tiny_model_dir, tmp_path):
     assert result.output_dir == str(tmp_path)
     assert result.optimizer_steps == 3  # ceil(10 / 4)
     assert "train_loss" in result.metrics
+    assert (result.engine, result.profile) == ("trl", "qwen3")
 
 
 def test_trim_history_keeps_system_and_recent_pairs():

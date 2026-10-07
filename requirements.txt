@@ -7,6 +7,7 @@ peft==0.21.0
 bitsandbytes==0.50.2
 accelerate==1.15.0
 datasets==5.0.1
+PyYAML==6.0.3          # finetune/model_profiles.yaml
 huggingface_hub==1.33.0
 fastapi==0.142.2
 uvicorn[standard]==0.54.0

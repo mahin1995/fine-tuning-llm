@@ -11,7 +11,7 @@ import argparse
 import statistics
 import sys
 
-from finetune.config import CHAT_TEMPLATE_KWARGS, DEFAULT_EVAL_DATA, DEFAULT_TRAIN_DATA
+from finetune.config import DEFAULT_EVAL_DATA, DEFAULT_TRAIN_DATA
 from finetune.data.io import load_conversations
 from finetune.data.schema import DataError
 from finetune.data.transforms import question_of
@@ -20,9 +20,12 @@ from finetune.data.transforms import question_of
 def token_lengths(conversations, tokenizer_name):
     from transformers import AutoTokenizer
 
+    from finetune.profiles import resolve_profile
+
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+    kwargs = resolve_profile(tokenizer_name).chat_template_kwargs
     return [
-        len(tokenizer.apply_chat_template(m, tokenize=True, **CHAT_TEMPLATE_KWARGS)["input_ids"])
+        len(tokenizer.apply_chat_template(m, tokenize=True, **kwargs)["input_ids"])
         for m in conversations
     ]
 

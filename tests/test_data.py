@@ -3,7 +3,6 @@ import json
 import pytest
 
 from conftest import EVAL_DATA, TRAIN_DATA
-from finetune.config import CHAT_TEMPLATE_KWARGS
 from finetune.data.io import load_conversations
 from finetune.data.schema import DataError, validate_messages, validate_prompt
 from finetune.data.transforms import to_prompt_completion, train_eval_split
@@ -70,10 +69,10 @@ def test_validate_prompt_requires_user_last():
 
 
 def test_to_prompt_completion_splits_last_turn():
-    row = to_prompt_completion([S, U, A, U, A])
+    row = to_prompt_completion([S, U, A, U, A], {"enable_thinking": False})
     assert row["prompt"] == [S, U, A, U]
     assert row["completion"] == [A]
-    assert row["chat_template_kwargs"] == CHAT_TEMPLATE_KWARGS
+    assert row["chat_template_kwargs"] == {"enable_thinking": False}
 
 
 def test_split_is_deterministic_and_disjoint():

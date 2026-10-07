@@ -328,9 +328,31 @@ tends to reproduce the same invalid output.
   moved package can't make a rule pass vacuously. Planted violations at the new paths are caught.
 - No behaviour change: all 255 tests pass.
 
+## Step 14 — Model profiles and the TrainingEngine port (ARCHITECTURE.md phase 2) *(done)*
+
+- **Model profiles** (`finetune/model_profiles.yaml`, `finetune/profiles.py`): the hardcoded
+  `CHAT_TEMPLATE_KWARGS` constant and the LoRA target list moved into per-model-family profiles
+  (qwen3, qwen2, llama, default). Lookup order:
+  1. the profile recorded in `run_info.json`
+  2. a LoRA adapter's base model
+  3. `config.json` `model_type`
+  4. the Hub id glob
+  5. `default`
+
+  `ChatModel` and the data transform now take the setting explicitly (no silent default), so
+  training and inference can't drift for any model.
+- **TrainingEngine port** (`finetune/training/engine.py`): `TrainingEngine.train(opts, profile)`
+  plus an `ENGINES` registry and `--engine` (only `trl` today). `trainer.py` → `trl_engine.py`
+  (`TrlEngine`). The engine-independent parts (profile resolution, `TrainResult`,
+  `TrainingOutOfMemory`, `write_run_info`) are shared. The engine and the profile are recorded
+  in `run_info.json`.
+- CLI: `train --engine`, `train --profile`; `download` prints the resolved profile.
+- No behaviour change for Qwen3: same `enable_thinking=False`, same LoRA layers. 282 tests
+  pass (27 new), including a fake engine plugged in with no change to callers.
+
 ## Tests
 
-`python -m pytest` runs 255 tests offline. The ops_crew tests skip themselves
+`python -m pytest` runs 282 tests offline. The ops_crew tests skip themselves
 when `requirements-crew.txt` isn't installed. They cover:
 - **finetune:** data, training (full and LoRA), template consistency, evaluation, serving
 - **agent:** the loop, the parser, tools and calculator safety, Qwen integration

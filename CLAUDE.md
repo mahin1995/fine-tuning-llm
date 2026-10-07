@@ -17,10 +17,10 @@ PYTHONPATH (`pytest.ini`, `run.sh`), so imports stay `import ops_crew`. Outside 
 - Everything GPU-related runs through `./run.sh ...` (Docker, project mounted at /workspace)
 
 ## Architecture rules (enforced by tests/test_architecture.py; keep them green)
-- `finetune` layering: config <- data/modeling <- training/evaluation/serving <- cli.
+- `finetune` layering: config, profiles <- data/modeling <- training/evaluation/serving <- cli.
   Only `finetune/cli/` wires concrete implementations together; inject dependencies elsewhere.
-- Lightweight modules (data, config, modeling.params, evaluation, serving.app, training.options,
-  the CLI dispatcher) must not import torch/transformers at module level. Import heavy libs lazily.
+- Lightweight modules (data, config, profiles, modeling.params, evaluation, serving.app,
+  training.options, training.engine, the CLI dispatcher) must not import torch/transformers at module level. Import heavy libs lazily.
 - `agent` core (loop, tools, parser, builtin_tools) never imports `finetune` or ML libraries.
   Only `agent/backends/*` and `agent/__main__.py` may import `finetune`. `finetune` never imports `agent`.
 - `ops_crew/domain/` is plain Python: no CrewAI, and from `finetune` only `finetune.data`. Only
@@ -30,8 +30,12 @@ PYTHONPATH (`pytest.ini`, `run.sh`), so imports stay `import ops_crew`. Outside 
   `ops_crew/refinement.py` imports `refiner`; the flow talks to it through `domain.ports.Refiner`.
 
 ## Rules that keep the pipeline correct
-- Training, inference and the agent must render prompts identically: always pass
-  `finetune.config.CHAT_TEMPLATE_KWARGS` to `apply_chat_template`. Don't add a second copy of that setting.
+- Training, inference and the agent must render prompts identically: always pass the model
+  profile's `chat_template_kwargs` (`finetune.profiles.resolve_profile`, defined in
+  `finetune/model_profiles.yaml`) to `apply_chat_template`. Never hardcode template variables in code;
+  model-family differences belong in the YAML. Training records the profile in `run_info.json`.
+- New training engines implement `finetune.training.engine.TrainingEngine` and register in `ENGINES`;
+  they must write `run_info.json` via `write_run_info` (the artifact contract in ARCHITECTURE.md).
 - Library versions are pinned in `requirements.txt` and the APIs differ from older docs
   (transformers 5: `dtype=` not `torch_dtype=`, `warmup_steps` takes a ratio float; trl 1.x
   `SFTConfig`). Check the installed source before using an argument.

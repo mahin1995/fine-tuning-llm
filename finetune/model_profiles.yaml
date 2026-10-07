@@ -1,0 +1,39 @@
+# Per-model-family settings that must be identical in training and inference.
+# Adding a new model family = adding an entry here, no code change.
+#
+# How a model is matched (first hit wins; see finetune/profiles.py):
+#   1. the `profile` recorded in a trained model's run_info.json
+#   2. a LoRA adapter's base model (adapter_config.json -> base_model_name_or_path)
+#   3. `model_type` in a local model's config.json      -> `model_types`
+#   4. the Hugging Face id (glob, case-insensitive)     -> `hub_ids`
+#   5. `default`
+#
+# chat_template_kwargs: passed to every apply_chat_template call (training, evaluation, chat,
+#                       agents). Unknown variables are ignored by other models' templates.
+# lora_target_modules:  layer names for LoRA, or "all-linear" (PEFT picks every linear layer).
+
+profiles:
+  qwen3:
+    model_types: [qwen3, qwen3_moe]
+    hub_ids: ["Qwen/Qwen3-*"]
+    # Qwen3 renders an empty <think></think> block when thinking is disabled.
+    chat_template_kwargs: {enable_thinking: false}
+    lora_target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+
+  qwen2:
+    model_types: [qwen2]
+    hub_ids: ["Qwen/Qwen2-*", "Qwen/Qwen2.5-*"]
+    chat_template_kwargs: {}
+    lora_target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+
+  llama:
+    model_types: [llama, mistral]
+    hub_ids: ["meta-llama/*", "mistralai/*"]
+    chat_template_kwargs: {}
+    lora_target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+
+  default:
+    model_types: []
+    hub_ids: []
+    chat_template_kwargs: {}
+    lora_target_modules: all-linear

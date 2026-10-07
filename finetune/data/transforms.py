@@ -1,20 +1,20 @@
 """Turn validated conversations into training examples."""
 import random
 
-from finetune.config import CHAT_TEMPLATE_KWARGS
 from finetune.data.schema import DataError
 
 
-def to_prompt_completion(messages):
+def to_prompt_completion(messages, chat_template_kwargs: dict):
     """Split a conversation into TRL's conversational prompt-completion format.
 
     Only the final assistant turn becomes the completion, so the loss is computed
-    on the answer, not on the question.
+    on the answer, not on the question. `chat_template_kwargs` comes from the model's
+    profile (finetune.profiles) so training renders prompts exactly like inference.
     """
     return {
         "prompt": messages[:-1],
         "completion": messages[-1:],
-        "chat_template_kwargs": CHAT_TEMPLATE_KWARGS,
+        "chat_template_kwargs": dict(chat_template_kwargs),
     }
 
 

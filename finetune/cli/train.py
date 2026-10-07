@@ -1,18 +1,27 @@
-"""Fine-tune a Qwen model.
+"""Fine-tune a causal language model.
 
     python -m finetune train                                   # full fine-tuning, defaults
     python -m finetune train --lora --merge                    # LoRA adapter (+ merged copy)
     python -m finetune train --epochs 10 --batch-size 2 --grad-accum 1   # smoke test on tiny data
     python -m finetune train --eval-ratio 0.1                  # hold out 10% for eval loss
+    python -m finetune train --model meta-llama/Llama-3.2-1B-Instruct    # profile resolved from the id
+    python -m finetune train --engine trl                      # training engine (see training/engine.py)
 """
 import argparse
 import sys
 
 from finetune.config import DEFAULT_BASE_MODEL, DEFAULT_OUTPUT_DIR, DEFAULT_TRAIN_DATA
+from finetune.profiles import load_profiles
+from finetune.training.engine import DEFAULT_ENGINE, engine_names
 from finetune.training.options import LoraOptions, TrainOptions
 
 
 def parse_options(argv=None) -> TrainOptions:
+    return parse(argv)[0]
+
+
+def parse(argv=None) -> tuple[TrainOptions, str]:
+    """Returns the training options and the engine name."""
     p = argparse.ArgumentParser(prog="python -m finetune train", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--model", default=DEFAULT_BASE_MODEL, help="base model (Hub id or local path)")
@@ -28,6 +37,9 @@ def parse_options(argv=None) -> TrainOptions:
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--save-checkpoints", action="store_true", help="also save a checkpoint each epoch (keeps 1)")
     p.add_argument("--no-gradient-checkpointing", action="store_true")
+    p.add_argument("--engine", choices=engine_names(), default=DEFAULT_ENGINE, help="training engine")
+    p.add_argument("--profile", choices=sorted(load_profiles()), default=None,
+                   help="model profile (default: resolved from --model, see finetune/model_profiles.yaml)")
     lora = p.add_argument_group("LoRA")
     lora.add_argument("--lora", action="store_true", help="train a LoRA adapter instead of all weights")
     lora.add_argument("--lora-r", type=int, default=16)
@@ -39,25 +51,26 @@ def parse_options(argv=None) -> TrainOptions:
     if a.merge and not a.lora:
         p.error("--merge only applies with --lora")
     try:
-        return TrainOptions(
+        opts = TrainOptions(
             model=a.model, data=a.data, output=a.output, eval_ratio=a.eval_ratio, epochs=a.epochs,
             lr=a.lr, batch_size=a.batch_size, grad_accum=a.grad_accum, max_length=a.max_length,
             warmup_ratio=a.warmup_ratio, seed=a.seed, save_checkpoints=a.save_checkpoints,
             gradient_checkpointing=not a.no_gradient_checkpointing,
             lora=LoraOptions(r=a.lora_r, alpha=a.lora_alpha, dropout=a.lora_dropout, merge=a.merge)
             if a.lora else None,
+            profile=a.profile,
         )
     except ValueError as e:
         p.error(str(e))
+    return opts, a.engine
 
 
 def main(argv=None):
-    opts = parse_options(argv)
-    # Heavy imports (torch, trl) only after argument parsing succeeded.
-    from finetune.training.trainer import TrainingOutOfMemory, run_training
+    opts, engine = parse(argv)
+    from finetune.training.engine import TrainingOutOfMemory, run_training
 
     try:
-        run_training(opts)
+        run_training(opts, engine)  # the engine imports its heavy stack (torch, trl) lazily
     except TrainingOutOfMemory as e:
         print(f"\n{e}", file=sys.stderr)
         return 2

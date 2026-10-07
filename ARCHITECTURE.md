@@ -5,8 +5,8 @@ others: the training engine (TRL → Unsloth), the inference runtime (own server
 Ollama) and the apps that use the model. [apps/ROADMAP.md](apps/ROADMAP.md) tracks feature progress,
 [PROCESS.md](PROCESS.md) the decisions taken so far.
 
-> Status: **phase 1 done** (rename `qwen_ft` → `finetune`, apps moved under `apps/`). The other
-> phases in section 6 move the rest of the code into this shape, each with the full test suite green.
+> Status: **phases 1–2 done** (rename `qwen_ft` → `finetune`, apps under `apps/`, model profiles,
+> `TrainingEngine` port). The other phases in section 6 follow, each with the full test suite green.
 
 ---
 
@@ -63,7 +63,8 @@ fine-tuning-llm/
 ```
 model.safetensors | adapter_model.safetensors + adapter_config.json   (full or LoRA)
 tokenizer files + chat template
-run_info.json      base model, engine (trl | unsloth), options, metrics, library versions
+run_info.json      base model, engine (trl | unsloth), profile + chat_template_kwargs, options,
+                   metrics, library versions
 ```
 - Producer: any `TrainingEngine`.
 - Consumers: `finetune evaluate`, `model_serving`, vLLM (reads it as is), Ollama (via a GGUF export).
@@ -94,7 +95,8 @@ POST /v1/chat/completions   {model, messages, max_tokens, temperature, top_p, st
 | `TrainingEngine.train(TrainOptions) -> TrainResult` | `TrlEngine` (today), `UnslothEngine` (future) | same `TrainOptions`, same artifact contract |
 | `ModelLoader` (for evaluation) | transformers in-process | evaluation needs per-token loss |
 
-Unchanged: `data/` (schema, validation, prompt-completion, split), `config.CHAT_TEMPLATE_KWARGS`.
+Model-family settings: `model_profiles.yaml` + `profiles.resolve_profile()` (chat template variables,
+LoRA target layers), recorded in `run_info.json`. Unchanged: `data/` (schema, validation, split).
 
 ### `model_serving`
 | Port | Adapters | Notes |
@@ -129,7 +131,7 @@ Rules carried over unchanged: `ops_crew/domain` stays plain Python, only `ops_cr
 **Duplication accepted on purpose:** `model_serving` re-implements model loading (full or
 LoRA) instead of importing `finetune.modeling`, so the serving image never depends on the
 training code. A cross-component test checks that `model_serving`'s Qwen3
-`chat_template_kwargs` equal `finetune.config.CHAT_TEMPLATE_KWARGS`.
+`chat_template_kwargs` equal the `qwen3` entry of `finetune/model_profiles.yaml`.
 
 ---
 
@@ -138,7 +140,7 @@ training code. A cross-component test checks that `model_serving`'s Qwen3
 | Phase | Change | Behaviour change |
 |---|---|---|
 | 1 ✅ | Rename `qwen_ft` → `finetune` (model-agnostic name); in-process LLM profile `qwen_ft` → `finetuned`. Move `agent/`, `ops_crew/`, `refiner/`, `requirements-crew.txt` (→ `apps/requirements.txt`), `ROADMAP.md` into `apps/`. Add `apps` to PYTHONPATH (`pytest.ini`, `run.sh`). Imports and commands stay the same (`python -m ops_crew`). | none |
-| 2 | `finetune`: model profiles (`config/models.yaml`: chat_template_kwargs, LoRA target modules per model family), extract `TrainingEngine` port, current trainer becomes `TrlEngine`, `--engine trl` (default), `run_info.json` records the engine. | none |
+| 2 ✅ | `finetune`: model profiles (`config/models.yaml`: chat_template_kwargs, LoRA target modules per model family), extract `TrainingEngine` port, current trainer becomes `TrlEngine`, `--engine trl` (default), `run_info.json` records the engine. | none |
 | 3 | `model_serving/`: config, download, OpenAI API, transformers engine, streaming, tools, contract check, own requirements, Dockerfile, run script. | new component |
 | 4 | `apps/chat_ui` as an OpenAI API client (UI moved from `finetune/serving`), `agent` `OpenAIBackend`, `finetune chat`/`serve` deprecated then removed. | chat goes through the server |
 | 5 | Architecture tests for the new rules, cross-component consistency tests, docs. | none |

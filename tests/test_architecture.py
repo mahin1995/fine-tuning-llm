@@ -43,7 +43,8 @@ def test_agent_core_is_independent_of_finetune_and_ml_libraries():
 @pytest.mark.parametrize("module", [
     "finetune.config", "finetune.data.io", "finetune.data.transforms", "finetune.modeling.params",
     "finetune.evaluation.evaluator", "finetune.evaluation.report", "finetune.serving.app",
-    "finetune.training.options", "finetune.cli.train", "finetune.__main__",
+    "finetune.training.options", "finetune.training.engine", "finetune.profiles", "finetune.cli.train",
+    "finetune.__main__",
 ])
 def test_light_modules_do_not_import_ml_libraries(module):
     assert not heavy(imported_modules(module)), f"{module} pulls in torch/transformers"
@@ -61,9 +62,10 @@ def _imports_of(path: Path):
 # package -> finetune packages it may import (cli is the composition root and may import anything)
 ALLOWED = {
     "config": set(),
+    "profiles": set(),
     "data": {"config", "data"},
-    "modeling": {"config", "modeling"},
-    "training": {"config", "data", "training"},
+    "modeling": {"config", "modeling", "profiles"},
+    "training": {"config", "data", "training", "profiles"},
     "evaluation": {"config", "modeling", "evaluation"},
     "serving": {"data", "modeling", "serving"},
 }

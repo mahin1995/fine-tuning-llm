@@ -1,9 +1,6 @@
-"""Supervised fine-tuning of a Qwen model with TRL's SFTTrainer."""
-import json
+"""TrlEngine: supervised fine-tuning with TRL's SFTTrainer (implements training.engine.TrainingEngine)."""
 import math
 import sys
-from dataclasses import asdict, dataclass
-from importlib.metadata import version
 from pathlib import Path
 
 import torch
@@ -13,21 +10,11 @@ from trl import SFTConfig, SFTTrainer
 
 from finetune.data.io import load_conversations
 from finetune.data.transforms import to_prompt_completion, train_eval_split
+from finetune.profiles import ModelProfile
+from finetune.training.engine import TrainingOutOfMemory, TrainResult, write_run_info
 from finetune.training.options import TrainOptions
 
 MIN_RECOMMENDED_STEPS = 10
-
-
-class TrainingOutOfMemory(RuntimeError):
-    """CUDA ran out of memory; the message says which options to change."""
-
-
-@dataclass
-class TrainResult:
-    output_dir: str
-    optimizer_steps: int
-    metrics: dict
-    merged_dir: str | None = None
 
 
 def pick_optimizer(use_cuda):
@@ -56,20 +43,27 @@ def warn_if_too_few_steps(n_train, opts):
     return total
 
 
-def build_peft_config(lora):
+def lora_targets(lora, profile: ModelProfile):
+    """Explicit LoraOptions.target_modules win; otherwise the model profile decides."""
+    if lora.target_modules is None:
+        return profile.lora_targets()
+    return lora.target_modules if isinstance(lora.target_modules, str) else list(lora.target_modules)
+
+
+def build_peft_config(lora, profile: ModelProfile):
     from peft import LoraConfig
 
     return LoraConfig(
         r=lora.r,
         lora_alpha=lora.alpha,
         lora_dropout=lora.dropout,
-        target_modules=list(lora.target_modules),
+        target_modules=lora_targets(lora, profile),
         task_type="CAUSAL_LM",
     )
 
 
-def to_dataset(conversations):
-    return Dataset.from_list([to_prompt_completion(c) for c in conversations])
+def to_dataset(conversations, chat_template_kwargs):
+    return Dataset.from_list([to_prompt_completion(c, chat_template_kwargs) for c in conversations])
 
 
 def oom_advice(opts):
@@ -81,18 +75,6 @@ def oom_advice(opts):
         "  3. --lora\n"
         "Check nothing else is using the GPU: nvidia-smi"
     )
-
-
-def write_run_info(opts, total_steps, metrics):
-    info = {
-        "base_model": opts.model,
-        "method": opts.method,
-        "options": asdict(opts),
-        "optimizer_steps": total_steps,
-        "metrics": metrics,
-        "versions": {pkg: version(pkg) for pkg in ("torch", "transformers", "trl", "peft", "datasets")},
-    }
-    (Path(opts.output) / "run_info.json").write_text(json.dumps(info, indent=2, default=str))
 
 
 def build_sft_config(opts, use_cuda, use_bf16, has_eval):
@@ -118,7 +100,14 @@ def build_sft_config(opts, use_cuda, use_bf16, has_eval):
     )
 
 
-def run_training(opts: TrainOptions) -> TrainResult:
+class TrlEngine:
+    name = "trl"
+
+    def train(self, opts: TrainOptions, profile: ModelProfile) -> TrainResult:
+        return _train(opts, profile, self.name)
+
+
+def _train(opts: TrainOptions, profile: ModelProfile, engine_name: str) -> TrainResult:
     set_seed(opts.seed)
     use_cuda = torch.cuda.is_available()
     use_bf16 = use_cuda and torch.cuda.is_bf16_supported()
@@ -127,6 +116,8 @@ def run_training(opts: TrainOptions) -> TrainResult:
 
     train_rows, eval_rows = train_eval_split(load_conversations(opts.data), opts.eval_ratio, opts.seed)
     total_steps = warn_if_too_few_steps(len(train_rows), opts)
+    print(f"model profile: {profile.name} (chat_template_kwargs={profile.chat_template_kwargs})")
+    kwargs = profile.chat_template_kwargs
 
     tokenizer = AutoTokenizer.from_pretrained(opts.model)
     if tokenizer.pad_token is None:
@@ -139,10 +130,10 @@ def run_training(opts: TrainOptions) -> TrainResult:
     trainer = SFTTrainer(
         model=model,
         args=build_sft_config(opts, use_cuda, use_bf16, has_eval=bool(eval_rows)),
-        train_dataset=to_dataset(train_rows),
-        eval_dataset=to_dataset(eval_rows) if eval_rows else None,
+        train_dataset=to_dataset(train_rows, kwargs),
+        eval_dataset=to_dataset(eval_rows, kwargs) if eval_rows else None,
         processing_class=tokenizer,
-        peft_config=build_peft_config(opts.lora) if opts.lora else None,
+        peft_config=build_peft_config(opts.lora, profile) if opts.lora else None,
     )
     if opts.lora:
         trainer.model.print_trainable_parameters()
@@ -158,7 +149,7 @@ def run_training(opts: TrainOptions) -> TrainResult:
 
     trainer.save_model(opts.output)  # LoRA: adapter only; full FT: all weights
     tokenizer.save_pretrained(opts.output)
-    write_run_info(opts, total_steps, metrics)
+    write_run_info(opts, engine=engine_name, profile=profile, optimizer_steps=total_steps, metrics=metrics)
     print(f"saved {'adapter' if opts.lora else 'model'} to {opts.output}", file=sys.stderr)
 
     merged_dir = None
@@ -169,4 +160,5 @@ def run_training(opts: TrainOptions) -> TrainResult:
         tokenizer.save_pretrained(merged_dir)
         print(f"saved merged model to {merged_dir}", file=sys.stderr)
 
-    return TrainResult(output_dir=opts.output, optimizer_steps=total_steps, metrics=metrics, merged_dir=merged_dir)
+    return TrainResult(output_dir=opts.output, optimizer_steps=total_steps, metrics=metrics, engine=engine_name,
+                       profile=profile.name, merged_dir=merged_dir)

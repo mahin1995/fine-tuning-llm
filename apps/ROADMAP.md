@@ -39,7 +39,7 @@ tests/      255টা offline test + architecture rule
 |---|---|
 | Data validation (format, duplicate, train/eval leakage, token length) | `finetune/data/`, `finetune/cli/validate_data.py` |
 | Training: full FT (fp32 + bf16 autocast + 8-bit AdamW) বা LoRA | `finetune/training/` |
-| Training আর inference-এ একই prompt format (`enable_thinking=False`) | `finetune/config.py` → `CHAT_TEMPLATE_KWARGS` |
+| Training আর inference-এ একই prompt format (`enable_thinking=False`) | `finetune/model_profiles.yaml` → model profile (`profiles.py`) |
 | Evaluation: base বনাম fine-tuned (answer loss + পাশাপাশি উত্তর) | `finetune/evaluation/` |
 | Terminal chat (streaming) | `finetune/cli/chat.py` |
 | FastAPI `/chat` + browser UI | `finetune/serving/` |

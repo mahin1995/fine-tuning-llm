@@ -4,7 +4,6 @@ import threading
 import torch
 from transformers import StoppingCriteria, StoppingCriteriaList, TextIteratorStreamer
 
-from finetune.config import CHAT_TEMPLATE_KWARGS
 from finetune.modeling.loading import load_model_and_tokenizer
 from finetune.modeling.params import GenerationParams
 
@@ -26,17 +25,23 @@ class ChatModel:
     template, which is how tool-calling agents describe the available tools.
     """
 
-    def __init__(self, model, tokenizer, name="model"):
+    def __init__(self, model, tokenizer, *, chat_template_kwargs: dict, name="model"):
         self.model = model
         self.tokenizer = tokenizer
         self.name = name
+        # From the model's profile: must match what the model saw during training.
+        self.chat_template_kwargs = dict(chat_template_kwargs)
         # One GPU, one model: serialize generate() calls coming from server threads.
         self._lock = threading.Lock()
 
     @classmethod
-    def load(cls, model_path, device=None):
+    def load(cls, model_path, device=None, profile=None):
+        """`profile`: a ModelProfile; resolved from the model id / directory when omitted."""
+        from finetune.profiles import resolve_profile
+
+        profile = profile or resolve_profile(str(model_path))
         model, tokenizer = load_model_and_tokenizer(model_path, device)
-        return cls(model, tokenizer, name=str(model_path))
+        return cls(model, tokenizer, chat_template_kwargs=profile.chat_template_kwargs, name=str(model_path))
 
     @property
     def device(self):
@@ -49,7 +54,7 @@ class ChatModel:
             add_generation_prompt=True,
             return_tensors="pt",
             return_dict=True,
-            **CHAT_TEMPLATE_KWARGS,
+            **self.chat_template_kwargs,
         ).to(self.device)
 
     def _generate_kwargs(self, inputs, params):
@@ -100,7 +105,7 @@ class ChatModel:
             prompt_messages + [{"role": "assistant", "content": answer}],
             return_tensors="pt",
             return_dict=True,
-            **CHAT_TEMPLATE_KWARGS,
+            **self.chat_template_kwargs,
         )["input_ids"].to(self.device)
         labels = full_ids.clone()
         labels[:, : prompt_ids.shape[1]] = -100  # score only the answer tokens

@@ -6,15 +6,16 @@
 import argparse
 import sys
 
-from finetune.config import CHAT_TEMPLATE_KWARGS, DEFAULT_BASE_MODEL
+from finetune.config import DEFAULT_BASE_MODEL
+from finetune.profiles import resolve_profile
 
 
-def check_template(tokenizer):
+def check_template(tokenizer, chat_template_kwargs):
     """The prompt the model sees at inference must be exactly how training examples start."""
     msgs = [{"role": "user", "content": "Hi"}, {"role": "assistant", "content": "Hello"}]
-    train_text = tokenizer.apply_chat_template(msgs, tokenize=False, **CHAT_TEMPLATE_KWARGS)
+    train_text = tokenizer.apply_chat_template(msgs, tokenize=False, **chat_template_kwargs)
     infer_text = tokenizer.apply_chat_template(msgs[:1], tokenize=False, add_generation_prompt=True,
-                                               **CHAT_TEMPLATE_KWARGS)
+                                               **chat_template_kwargs)
     print("\nchat template, training format:")
     print(train_text)
     print("chat template, inference prompt:")
@@ -55,7 +56,10 @@ def main(argv=None):
     if not cached:
         print("cache on disk:   not in the HF cache (loaded from a local path?)")
 
-    check_template(tokenizer)
+    profile = resolve_profile(model_id)
+    print(f"model profile:   {profile.name} (chat_template_kwargs={profile.chat_template_kwargs}, "
+          f"lora targets={profile.lora_targets()})")
+    check_template(tokenizer, profile.chat_template_kwargs)
     print("OK: model + tokenizer ready, train/inference formats match")
     return 0
 
