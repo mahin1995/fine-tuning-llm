@@ -3,7 +3,7 @@
 No network needed, runs on CPU in seconds. The chat template mirrors the parts of
 Qwen3's template this project depends on: ChatML turns, the empty <think> block in
 non-thinking mode, and tool calling (<tools> system block, <tool_call> in assistant
-turns, <tool_response> for tool results). `python -m qwen_ft download` re-checks
+turns, <tool_response> for tool results). `python -m finetune download` re-checks
 the real template.
 """
 import json

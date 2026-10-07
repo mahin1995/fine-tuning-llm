@@ -3,10 +3,10 @@ import json
 import pytest
 
 from conftest import EVAL_DATA, TRAIN_DATA
-from qwen_ft.config import CHAT_TEMPLATE_KWARGS
-from qwen_ft.data.io import load_conversations
-from qwen_ft.data.schema import DataError, validate_messages, validate_prompt
-from qwen_ft.data.transforms import to_prompt_completion, train_eval_split
+from finetune.config import CHAT_TEMPLATE_KWARGS
+from finetune.data.io import load_conversations
+from finetune.data.schema import DataError, validate_messages, validate_prompt
+from finetune.data.transforms import to_prompt_completion, train_eval_split
 
 U = {"role": "user", "content": "q"}
 A = {"role": "assistant", "content": "a"}

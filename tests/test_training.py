@@ -4,16 +4,16 @@ import json
 import pytest
 
 from conftest import EVAL_DATA, TRAIN_DATA
-from qwen_ft.cli import evaluate as evaluate_cli
-from qwen_ft.cli import train as train_cli
-from qwen_ft.cli.chat import trim_history
-from qwen_ft.config import CHAT_TEMPLATE_KWARGS
-from qwen_ft.data.io import load_conversations
-from qwen_ft.modeling.chat_model import ChatModel
-from qwen_ft.modeling.loading import is_adapter_dir
-from qwen_ft.modeling.params import GenerationParams
-from qwen_ft.training.options import LoraOptions, TrainOptions
-from qwen_ft.training.trainer import run_training
+from finetune.cli import evaluate as evaluate_cli
+from finetune.cli import train as train_cli
+from finetune.cli.chat import trim_history
+from finetune.config import CHAT_TEMPLATE_KWARGS
+from finetune.data.io import load_conversations
+from finetune.modeling.chat_model import ChatModel
+from finetune.modeling.loading import is_adapter_dir
+from finetune.modeling.params import GenerationParams
+from finetune.training.options import LoraOptions, TrainOptions
+from finetune.training.trainer import run_training
 
 GREEDY_SHORT = GenerationParams(temperature=0.0, max_new_tokens=8)
 

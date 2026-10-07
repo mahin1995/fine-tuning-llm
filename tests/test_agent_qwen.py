@@ -4,8 +4,8 @@ import warnings
 from agent import Agent
 from agent.backends.qwen import QwenBackend
 from agent.builtin_tools import default_registry
-from qwen_ft.modeling.chat_model import ChatModel
-from qwen_ft.modeling.params import GenerationParams
+from finetune.modeling.chat_model import ChatModel
+from finetune.modeling.params import GenerationParams
 
 
 def test_tools_are_rendered_into_the_prompt(tiny_model_dir):

@@ -4,88 +4,84 @@ Fine-tune `Qwen/Qwen3-0.6B` on a Java / Spring Boot Q&A dataset, chat with it fr
 the terminal or a browser, and run it as a tool-calling agent. Everything runs in
 Docker on a single NVIDIA GPU (tested target: RTX 3060 12GB). See
 [ARCHITECTURE.md](ARCHITECTURE.md) for the component design and dependency rules,
-[ROADMAP.md](ROADMAP.md) for the goal, feature summary and learning-level progress,
+[apps/ROADMAP.md](apps/ROADMAP.md) for the goal, feature summary and learning-level progress,
 [PROCESS.md](PROCESS.md) for the full log and the reasoning behind each decision.
 
 ## Project layout
 
+Three components, each with its own dependencies (see [ARCHITECTURE.md](ARCHITECTURE.md)):
+
 ```
-data/                     datasets (Qwen chat format, one JSON object per line)
-  train.jsonl             training data
-  eval.jsonl              held-out questions with reference answers (never trained on)
+data/                       datasets (chat format, one JSON object per line)
+  train.jsonl               training data
+  eval.jsonl                held-out questions with reference answers (never trained on)
 
-qwen_ft/                  fine-tuning harness            -> python -m qwen_ft <command>
-  config.py               shared constants (base model, paths, CHAT_TEMPLATE_KWARGS)
-  data/                   schema validation, JSONL loading, prompt-completion + split   (no torch)
-  modeling/               params (GenerationParams), loading (full / LoRA), chat_model (ChatModel)
-  training/               options (TrainOptions dataclass), trainer (run_training)
-  evaluation/             evaluator (model loader injected), report (markdown)
-  serving/                app (FastAPI, model injected) + static/index.html
-  cli/                    one module per command; the only place that wires packages together
+finetune/                   CORE: data -> train -> evaluate      -> python -m finetune <command>
+  config.py                 shared constants (base model, paths, CHAT_TEMPLATE_KWARGS)
+  data/                     schema validation, JSONL loading, prompt-completion + split   (no torch)
+  modeling/                 params (GenerationParams), loading (full / LoRA), chat_model (ChatModel)
+  training/                 options (TrainOptions dataclass), trainer (run_training)
+  evaluation/               evaluator (model loader injected), report (markdown)
+  serving/                  app (FastAPI, model injected) + static/index.html   (moves to apps/chat_ui)
+  cli/                      one module per command; the only place that wires packages together
 
-agent/                    tool-calling agent loop         -> python -m agent
-  backend.py              ChatBackend protocol: complete(messages, tools) -> str
-  parser.py               <tool_call>{json}</tool_call> parsing
-  tools.py                Tool, ToolRegistry (JSON schema from type hints, argument validation)
-  loop.py                 Agent.run(question) -> AgentResult (answer, steps, transcript)
-  builtin_tools.py        calculator (safe AST), current_time, search_knowledge_base
-  backends/qwen.py        adapter to qwen_ft's ChatModel: the only bridge between the two packages
+apps/                       APPS: everything that uses a model (on PYTHONPATH, see below)
+  requirements.txt          crewai, pydantic-ai, pydantic-settings
+  ROADMAP.md                learning levels: what is done, where, what is next
+  agent/                    tool-calling agent loop          -> python -m agent
+    loop.py, tools.py, parser.py, builtin_tools.py, backend.py (ChatBackend port)
+    backends/qwen.py        adapter to finetune's ChatModel: the only bridge between the two
+  ops_crew/                 hybrid CrewAI agent: Dataset Ops Assistant  -> python -m ops_crew "<request>"
+    schemas.py, settings.py, config/ (agents, tasks, llms, refine .yaml)
+    domain/                 deterministic layer, plain Python (no CrewAI)
+    flow.py                 CrewAI Flow: intake -> crew -> validate -> authorize -> approve -> execute
+    crew/                   3-agent sequential crew, read-only tools, LLM factory with fallbacks
+    evals/                  14 golden cases + runner         -> python -m ops_crew.evals
+    refinement.py           adapter to `refiner` (the only module that imports it)
+  refiner/                  generic self-correction + reflection on PydanticAI (domain-agnostic)
 
-ops_crew/                 hybrid CrewAI agent: Dataset Ops Assistant  -> python -m ops_crew "<request>"
-  schemas.py              Pydantic contracts for every crew output
-  settings.py             OPS_* env settings (thresholds, paths, retries, timeouts)
-  config/                 agents.yaml, tasks.yaml, llms.yaml (multi-LLM profiles)
-  domain/                 deterministic layer, plain Python: validation, policy, idempotency,
-                          approval, audit, repository, executor            (no CrewAI)
-  flow.py                 CrewAI Flow: intake -> crew -> validate -> authorize -> approve -> execute
-  crew/                   3-agent sequential crew, read-only tools, LLM factory with fallbacks
-  evals/                  14 golden cases + runner              -> python -m ops_crew.evals
-  refinement.py           adapter to `refiner` (the only module that imports it)
-
-refiner/                  generic self-correction + reflection on PydanticAI (domain-agnostic)
-  correction.py           self_correct(): typed output, schema/check problems fed back as ModelRetry
-  reflection.py           reflect(): critic -> reviser loop, best-so-far, stop rules
-  models.py               OpenAI-compatible / Ollama / local function models, output modes, fallback
-
-tests/                    CPU tests (tiny local Qwen3 model, scripted LLMs for CrewAI), incl. architecture rules
+tests/                      CPU tests (tiny local Qwen3 model, scripted LLMs for CrewAI), incl. architecture rules
 ```
+
+**Running outside Docker:** the apps live under `apps/`, so put both roots on the path:
+`export PYTHONPATH=.:apps` (`run.sh` and `pytest.ini` already do this).
 
 ### Dependency rules (enforced by `tests/test_architecture.py`)
 
 | Package | May import (inside this repo) |
 |---|---|
-| `qwen_ft.config` | nothing |
-| `qwen_ft.data` | config |
-| `qwen_ft.modeling` | config |
-| `qwen_ft.training` | config, data |
-| `qwen_ft.evaluation` | config, modeling.params (model loader is injected) |
-| `qwen_ft.serving` | data, modeling.params (model is injected) |
-| `qwen_ft.cli` | anything (composition root) |
-| `agent` core (loop, tools, parser, builtin_tools) | nothing from `qwen_ft` |
-| `agent/backends/qwen.py`, `agent/__main__.py` | `qwen_ft` (the only bridge) |
+| `finetune.config` | nothing |
+| `finetune.data` | config |
+| `finetune.modeling` | config |
+| `finetune.training` | config, data |
+| `finetune.evaluation` | config, modeling.params (model loader is injected) |
+| `finetune.serving` | data, modeling.params (model is injected) |
+| `finetune.cli` | anything (composition root) |
+| `agent` core (loop, tools, parser, builtin_tools) | nothing from `finetune` |
+| `agent/backends/qwen.py`, `agent/__main__.py` | `finetune` (the only bridge) |
 | `refiner` | only `pydantic` / `pydantic_ai` (no project package) |
 | `ops_crew/refinement.py` | `refiner` (the only module that may) |
 
-`qwen_ft` never imports `agent`. `ops_crew.domain` imports no CrewAI and only reuses
-`qwen_ft.data`; only `ops_crew/crew/`, `flow.py`, `evals/` and `__main__` import CrewAI;
-`qwen_ft`, `agent` and `ops_crew` never import each other sideways. Lightweight modules (`data`, `config`, `modeling.params`, `evaluation`, `serving.app`,
+`finetune` never imports `agent`. `ops_crew.domain` imports no CrewAI and only reuses
+`finetune.data`; only `ops_crew/crew/`, `flow.py`, `evals/` and `__main__` import CrewAI;
+`finetune`, `agent` and `ops_crew` never import each other sideways. Lightweight modules (`data`, `config`, `modeling.params`, `evaluation`, `serving.app`,
 `training.options`, the CLI dispatcher) must not import torch/transformers; tests check this too.
 
 ## Quick start
 
 ```bash
 ./run.sh build                                   # build image (pins library versions)
-./run.sh python -m qwen_ft download              # download Qwen3-0.6B + sanity checks
-./run.sh python -m qwen_ft validate              # check data/train.jsonl, data/eval.jsonl
+./run.sh python -m finetune download              # download Qwen3-0.6B + sanity checks
+./run.sh python -m finetune validate              # check data/train.jsonl, data/eval.jsonl
 ./run.sh python -m pytest                        # test suite (~30s, CPU is enough)
 
-./run.sh python -m qwen_ft train                 # full fine-tuning
-./run.sh python -m qwen_ft train --lora --merge  # or: LoRA adapter (+ merged copy)
-nohup ./run.sh python -m qwen_ft train > train.log 2>&1 &   # long runs in the background
+./run.sh python -m finetune train                 # full fine-tuning
+./run.sh python -m finetune train --lora --merge  # or: LoRA adapter (+ merged copy)
+nohup ./run.sh python -m finetune train > train.log 2>&1 &   # long runs in the background
 
-./run.sh python -m qwen_ft evaluate --model outputs/qwen3-ft
-./run.sh python -m qwen_ft chat --model outputs/qwen3-ft
-PORT=8000 ./run.sh python -m qwen_ft serve --model outputs/qwen3-ft   # http://localhost:8000
+./run.sh python -m finetune evaluate --model outputs/qwen3-ft
+./run.sh python -m finetune chat --model outputs/qwen3-ft
+PORT=8000 ./run.sh python -m finetune serve --model outputs/qwen3-ft   # http://localhost:8000
 
 ./run.sh python -m agent --model outputs/qwen3-ft "What is 17 * 23?"  # one question
 ./run.sh python -m agent --model Qwen/Qwen3-0.6B                      # interactive
@@ -94,7 +90,7 @@ PORT=8000 ./run.sh python -m qwen_ft serve --model outputs/qwen3-ft   # http://l
 Smoke test on the 10-example dataset (the defaults give only 3 optimizer steps):
 
 ```bash
-./run.sh python -m qwen_ft train --epochs 10 --batch-size 2 --grad-accum 1
+./run.sh python -m finetune train --epochs 10 --batch-size 2 --grad-accum 1
 ```
 
 ## The agent loop
@@ -160,7 +156,7 @@ Intent Classifier (no tools) -> Dataset Researcher (search, get, duplicate, eval
 manager would add LLM calls and unpredictability for no gain.
 
 **Multi-LLM** (`ops_crew/config/llms.yaml`): profiles `local` (any OpenAI-compatible server: Ollama, vLLM, ...),
-`openai`, `anthropic`, `qwen_ft` (this repo's model, experimental). Per agent:
+`openai`, `anthropic`, `finetune` (this repo's model, experimental). Per agent:
 `OPS_LLM_PROFILE_<AGENT>` > `OPS_LLM_PROFILE` > `llm:` in agents.yaml. Profiles list `fallbacks` that are tried
 when a provider fails (skipped if their key isn't set). Keys come only from env vars named in the profile.
 
@@ -218,7 +214,7 @@ crew proposal ─► validate each task output ─► correctable problem? ─ye
   `output_mode: prompted` (schema in the prompt, no tool calling needed); set `tool` or
   `native` per profile in `llms.yaml` if your server supports it.
 - PydanticAI is pinned to 1.107.7 for compatibility with CrewAI 1.15, and Anthropic profiles
-  aren't available to the refiner; see `requirements-crew.txt` for the reasons.
+  aren't available to the refiner; see `apps/requirements.txt` for the reasons.
 
 ## Key design decisions
 
@@ -226,7 +222,7 @@ crew proposal ─► validate each task output ─► correctable problem? ─ye
   the loss. Qwen3's template has no `{% generation %}` markers, so TRL's
   `assistant_only_loss` can't be used; splitting into prompt/completion gives the
   same effect.
-- **`enable_thinking=False` everywhere** (`qwen_ft.config.CHAT_TEMPLATE_KWARGS`).
+- **`enable_thinking=False` everywhere** (`finetune.config.CHAT_TEMPLATE_KWARGS`).
   Training, inference and the agent use the same setting so the formats match.
 - **Full FT loads fp32 weights + bf16 autocast.** Pure-bf16 weights would round
   small updates away. 8-bit AdamW keeps it inside 12GB VRAM.

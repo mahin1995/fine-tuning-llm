@@ -11,7 +11,7 @@ from agent.builtin_tools import (
 )
 from agent.tools import ToolError, ToolRegistry, make_tool, schema_from_signature
 from conftest import TRAIN_DATA
-from qwen_ft.data.io import load_conversations
+from finetune.data.io import load_conversations
 
 
 def test_schema_from_signature():

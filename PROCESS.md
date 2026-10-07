@@ -72,7 +72,7 @@ disposable and nothing else depends on its system Python.
   the project aren't root-owned.
 - Falls back to `sudo docker` automatically if the `docker` group isn't active
   in the current shell yet.
-- Uses `-it` only when a terminal is attached, so `nohup ./run.sh python -m qwen_ft train &` works.
+- Uses `-it` only when a terminal is attached, so `nohup ./run.sh python -m finetune train &` works.
 - Publishes a port only when `PORT=...` is set, bound to `127.0.0.1`, so training
   and a debug shell can run side by side.
 - Sets `USER` for libraries that look up the user name (the mapped uid has no passwd entry).
@@ -81,7 +81,7 @@ disposable and nothing else depends on its system Python.
 ./run.sh build                      # build the qwen-ft image
 ./run.sh python ...                 # run a command inside it
 ./run.sh bash                       # interactive shell
-PORT=8000 ./run.sh python -m qwen_ft serve  # with a published port
+PORT=8000 ./run.sh python -m finetune serve  # with a published port
 ```
 
 **Verified** — all libraries import correctly, and torch is still the CUDA
@@ -108,12 +108,12 @@ field injection, global exception handling, auto-configuration, JPA fetch
 types, self-invocation proxy pitfall, rollback-on-checked-exceptions).
 
 **Validated:** all 10 lines are valid JSON with the expected `user`/`assistant`
-role structure. `python -m qwen_ft validate` now checks this automatically, along with
+role structure. `python -m finetune validate` now checks this automatically, along with
 duplicates and train/eval leakage. With `--tokenizer` it also reports token lengths.
 
 [data/eval.jsonl](data/eval.jsonl) holds 8 held-out Q&A pairs on topics not in the training
 set (open-in-view, optimistic locking, `getReferenceById`, NESTED propagation, …),
-used by `python -m qwen_ft evaluate`.
+used by `python -m finetune evaluate`.
 
 **Note on dataset size:** 10 examples is only enough to smoke-test the
 pipeline. Training 3 epochs on this will make the model memorize these exact
@@ -136,14 +136,14 @@ Checked the HF Hub API for both candidate models before downloading:
 Ollama-only), so it's the model used — no need to fall back to
 Qwen2.5-0.5B-Instruct.
 
-[qwen_ft/cli/download_model.py](qwen_ft/cli/download_model.py) downloads model + tokenizer via
+[finetune/cli/download_model.py](finetune/cli/download_model.py) downloads model + tokenizer via
 `from_pretrained()`, loads weights in bf16, and prints:
 - parameter count and bf16 memory footprint
 - HF cache location and size on disk
 - the Qwen chat template rendering (sanity check before training)
 
 ```bash
-./run.sh python -m qwen_ft download
+./run.sh python -m finetune download
 ```
 
 It also asserts that pad != eos and that the inference prompt
@@ -154,7 +154,7 @@ training format. That check runs against the real Qwen3 template.
 
 ## Step 4 — Training Script *(written, tested on CPU)*
 
-[qwen_ft/training/trainer.py](qwen_ft/training/trainer.py) uses TRL `SFTTrainer` and was checked against the installed
+[finetune/training/trainer.py](finetune/training/trainer.py) uses TRL `SFTTrainer` and was checked against the installed
 `transformers 5.17` / `trl 1.13` source:
 - Data is converted to **prompt-completion** format, so loss is only on the final
   assistant answer. `assistant_only_loss` needs `{% generation %}` markers that
@@ -175,13 +175,13 @@ training format. That check runs against the real Qwen3 template.
 ## Step 5 — Training Run *(not started — needs the GPU host)*
 
 ```bash
-./run.sh python -m qwen_ft train --epochs 10 --batch-size 2 --grad-accum 1   # smoke test, 10 examples
-nohup ./run.sh python -m qwen_ft train > train.log 2>&1 &                    # real run
+./run.sh python -m finetune train --epochs 10 --batch-size 2 --grad-accum 1   # smoke test, 10 examples
+nohup ./run.sh python -m finetune train > train.log 2>&1 &                    # real run
 ```
 
 ## Step 6 — Evaluation *(written, tested on CPU)*
 
-[qwen_ft/evaluation/](qwen_ft/evaluation/) loads the base and fine-tuned models one at a time and,
+[finetune/evaluation/](finetune/evaluation/) loads the base and fine-tuned models one at a time and,
 for each `eval.jsonl` example, records:
 - the **answer loss**: mean NLL of the reference answer, lower is better
 - the greedy answer from each model
@@ -190,16 +190,16 @@ It writes `outputs/qwen3-ft/eval_report.md`.
 
 ## Step 7 — Chat CLI *(written, tested on CPU)*
 
-- [qwen_ft/modeling/](qwen_ft/modeling/) holds the shared loading code (full model or LoRA
+- [finetune/modeling/](finetune/modeling/) holds the shared loading code (full model or LoRA
   adapter, merged on load) and generation (Qwen3 non-thinking sampling defaults,
   streaming, early stop).
-- [qwen_ft/cli/chat.py](qwen_ft/cli/chat.py) is an interactive chat with streaming output, `/reset`,
+- [finetune/cli/chat.py](finetune/cli/chat.py) is an interactive chat with streaming output, `/reset`,
   `/exit`, `--system` and bounded history.
 
 ## Step 8 — Chat API + Web UI *(written, tested on CPU)*
 
-[qwen_ft/serving/app.py](qwen_ft/serving/app.py) is a FastAPI app with `GET /`
-([qwen_ft/serving/static/index.html](qwen_ft/serving/static/index.html)), `GET /health` and `POST /chat`. Requests
+[finetune/serving/app.py](finetune/serving/app.py) is a FastAPI app with `GET /`
+([finetune/serving/static/index.html](finetune/serving/static/index.html)), `GET /health` and `POST /chat`. Requests
 are validated with the same rules as the training data, plus limits on message
 count, content length, `max_new_tokens` and temperature. Generation runs in a
 worker thread behind a lock, so the single GPU model is never called concurrently.
@@ -208,8 +208,8 @@ worker thread behind a lock, so the single GPU model is never called concurrentl
 
 The flat scripts were split into two top-level packages with enforced boundaries
 (see README "Project layout" for the full tree):
-- `qwen_ft/` holds config, data, modeling, training, evaluation, serving and cli.
-  Commands run as `python -m qwen_ft <command>`.
+- `finetune/` holds config, data, modeling, training, evaluation, serving and cli.
+  Commands run as `python -m finetune <command>`.
 - Data moved to `data/train.jsonl` and `data/eval.jsonl`.
 - Training logic takes a `TrainOptions` dataclass instead of argparse args, so it can
   be called from code. The evaluator receives a model loader and the server receives
@@ -251,7 +251,7 @@ add_example and remove_example. **The LLM proposes, deterministic code decides a
 
 - **Deterministic layer** (`domain/`, plain Python, no CrewAI):
   - Pydantic validation of every task output, with 2 retries and then escalation
-  - role- and business-rule policy that reuses `qwen_ft.data` (duplicates, eval leakage,
+  - role- and business-rule policy that reuses `finetune.data` (duplicates, eval leakage,
     and ids that must exist)
   - idempotency keys, plus an approval gateway for destructive or suspicious side effects
   - a JSON audit log with correlation ids
@@ -262,7 +262,7 @@ add_example and remove_example. **The LLM proposes, deterministic code decides a
   temperature 0, `max_iter` / `max_execution_time` limits, `output_pydantic` on every
   task, and read-only traced tools.
 - **Multi-LLM**: profiles in `llms.yaml` (local OpenAI-compatible server, OpenAI,
-  Anthropic, in-process qwen_ft), selected per agent with env overrides, with a provider
+  Anthropic, in-process finetune), selected per agent with env overrides, with a provider
   fallback chain. Keys come only from env vars, and missing keys fail at startup.
 - **Verified CrewAI 1.15 behaviour** (by running it, not from docs):
   - Flows run offline.
@@ -290,7 +290,7 @@ tends to reproduce the same invalid output.
     can't make the result worse. It stops on acceptance, after max rounds, when the score stops
     improving, or when the output repeats. Ungrounded drafts are capped at a score of 0.5.
   - Models: OpenAI-compatible, Ollama, or any local text function (including this repo's
-    `qwen_ft`). Output modes are `tool`, `native` and `prompted`, with a `FallbackModel` that
+    `finetune`). Output modes are `tool`, `native` and `prompted`, with a `FallbackModel` that
     also falls back on network errors.
 - **ops_crew integration:**
   - `domain/correction.py` separates correctable problems from final ones.
@@ -314,11 +314,25 @@ tends to reproduce the same invalid output.
   self-correction and reflection statistics.
 - **Not yet run against a real LLM** (none is reachable from the dev container).
 
+## Step 13 — Restructure into components (ARCHITECTURE.md phase 1) *(done)*
+
+- `qwen_ft` → **`finetune`**. The training/evaluation code was already model-agnostic, and the
+  Qwen-specific bits (default model, `enable_thinking`) move to per-model profiles in phase 2.
+  Commands are now `python -m finetune <command>`. Earlier entries in this log were updated to
+  the new name.
+- `agent/`, `ops_crew/`, `refiner/` moved under **`apps/`** (`requirements-crew.txt` →
+  `apps/requirements.txt`, `ROADMAP.md` → `apps/ROADMAP.md`). `apps/` is on PYTHONPATH
+  (`pytest.ini`, `run.sh`), so imports and `python -m ...` commands are unchanged.
+- The in-process LLM profile `qwen_ft` → `finetuned` (`FinetunedLLM`, `OPS_FINETUNED_MODEL_PATH`).
+- Architecture tests now resolve each package's location and fail if it can't be found, so a
+  moved package can't make a rule pass vacuously. Planted violations at the new paths are caught.
+- No behaviour change: all 255 tests pass.
+
 ## Tests
 
 `python -m pytest` runs 255 tests offline. The ops_crew tests skip themselves
 when `requirements-crew.txt` isn't installed. They cover:
-- **qwen_ft:** data, training (full and LoRA), template consistency, evaluation, serving
+- **finetune:** data, training (full and LoRA), template consistency, evaluation, serving
 - **agent:** the loop, the parser, tools and calculator safety, Qwen integration
 - **ops_crew:** the domain layer, every flow route with a mocked crew, real CrewAI
   agents on scripted LLMs, evals with an oracle crew

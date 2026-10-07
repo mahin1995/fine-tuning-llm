@@ -1,34 +1,37 @@
 # CLAUDE.md
 
-Fine-tuning harness for Qwen3-0.6B (`qwen_ft/`: TRL SFT, full or LoRA, eval, CLI chat, FastAPI),
+Fine-tuning harness for Qwen3-0.6B (`finetune/`: TRL SFT, full or LoRA, eval, CLI chat, FastAPI),
 a model-agnostic tool-calling agent loop (`agent/`), and a hybrid CrewAI agent (`ops_crew/`:
 deterministic Flow + 3-agent crew) that curates the training data, with self-correction and
 reflection from the generic `refiner/` package (PydanticAI).
-README.md has the layout, dependency rules and commands; PROCESS.md has the decision log.
+README.md has the layout and commands, ARCHITECTURE.md the component design and dependency rules,
+PROCESS.md the decision log, apps/ROADMAP.md the learning-level progress.
+Layout: `finetune/` (core) at the root; `agent/`, `ops_crew/`, `refiner/` under `apps/`, which is on
+PYTHONPATH (`pytest.ini`, `run.sh`), so imports stay `import ops_crew`. Outside Docker: `export PYTHONPATH=.:apps`.
 
 ## Commands
 - Tests (CPU, no network, ~30s): `python -m pytest` (or `./run.sh python -m pytest` in Docker)
-- Data check: `python -m qwen_ft validate`
-- All commands: `python -m qwen_ft --help`, `python -m agent --help`, `python -m ops_crew --help`
+- Data check: `python -m finetune validate`
+- All commands: `python -m finetune --help`, `python -m agent --help`, `python -m ops_crew --help`
 - Crew evals (need a real LLM): `python -m ops_crew.evals` (pass threshold in `ops_crew/evals/golden.yaml`)
 - Everything GPU-related runs through `./run.sh ...` (Docker, project mounted at /workspace)
 
 ## Architecture rules (enforced by tests/test_architecture.py; keep them green)
-- `qwen_ft` layering: config <- data/modeling <- training/evaluation/serving <- cli.
-  Only `qwen_ft/cli/` wires concrete implementations together; inject dependencies elsewhere.
+- `finetune` layering: config <- data/modeling <- training/evaluation/serving <- cli.
+  Only `finetune/cli/` wires concrete implementations together; inject dependencies elsewhere.
 - Lightweight modules (data, config, modeling.params, evaluation, serving.app, training.options,
   the CLI dispatcher) must not import torch/transformers at module level. Import heavy libs lazily.
-- `agent` core (loop, tools, parser, builtin_tools) never imports `qwen_ft` or ML libraries.
-  Only `agent/backends/*` and `agent/__main__.py` may import `qwen_ft`. `qwen_ft` never imports `agent`.
-- `ops_crew/domain/` is plain Python: no CrewAI, and from `qwen_ft` only `qwen_ft.data`. Only
-  `ops_crew/crew/`, `flow.py`, `evals/` and `__main__.py` import CrewAI. `qwen_ft`, `agent` and
+- `agent` core (loop, tools, parser, builtin_tools) never imports `finetune` or ML libraries.
+  Only `agent/backends/*` and `agent/__main__.py` may import `finetune`. `finetune` never imports `agent`.
+- `ops_crew/domain/` is plain Python: no CrewAI, and from `finetune` only `finetune.data`. Only
+  `ops_crew/crew/`, `flow.py`, `evals/` and `__main__.py` import CrewAI. `finetune`, `agent` and
   `ops_crew` never import each other sideways.
 - `refiner/` imports only pydantic / pydantic_ai (it is domain-agnostic). Only
   `ops_crew/refinement.py` imports `refiner`; the flow talks to it through `domain.ports.Refiner`.
 
 ## Rules that keep the pipeline correct
 - Training, inference and the agent must render prompts identically: always pass
-  `qwen_ft.config.CHAT_TEMPLATE_KWARGS` to `apply_chat_template`. Don't add a second copy of that setting.
+  `finetune.config.CHAT_TEMPLATE_KWARGS` to `apply_chat_template`. Don't add a second copy of that setting.
 - Library versions are pinned in `requirements.txt` and the APIs differ from older docs
   (transformers 5: `dtype=` not `torch_dtype=`, `warmup_steps` takes a ratio float; trl 1.x
   `SFTConfig`). Check the installed source before using an argument.

@@ -2,4 +2,4 @@
 # Keeping everything else out keeps the build context tiny (no venv, outputs, data).
 *
 !requirements.txt
-!requirements-crew.txt
+!apps/requirements.txt

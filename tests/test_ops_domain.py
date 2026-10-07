@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-pytest.importorskip("pydantic_settings")  # ops_crew deps (requirements-crew.txt)
+pytest.importorskip("pydantic_settings")  # ops_crew deps (apps/requirements.txt)
 
 from ops_crew.domain.actions import ActionExecutor
 from ops_crew.domain.approval import ApprovalRequest, ConsoleApproval, DenyAllApprovals

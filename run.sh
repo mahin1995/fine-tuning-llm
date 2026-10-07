@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # Usage:
 #   ./run.sh build                                   build the qwen-ft image
-#   ./run.sh python -m qwen_ft train                 run a command inside the container
+#   ./run.sh python -m finetune train                 run a command inside the container
 #   ./run.sh python -m agent "What is 17 * 23?"      run the tool-calling agent
 #   ./run.sh python -m ops_crew --role editor "..."  run the hybrid CrewAI ops assistant
 #   ./run.sh bash                                    interactive shell
-#   PORT=8000 ./run.sh python -m qwen_ft serve       also publish a port (on 127.0.0.1 only)
-#   nohup ./run.sh python -m qwen_ft train > train.log 2>&1 &   works too (no TTY needed)
+#   PORT=8000 ./run.sh python -m finetune serve       also publish a port (on 127.0.0.1 only)
+#   nohup ./run.sh python -m finetune train > train.log 2>&1 &   works too (no TTY needed)
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -33,11 +33,12 @@ PORT_FLAGS=()
 if [ -n "${PORT:-}" ]; then PORT_FLAGS=(-p "127.0.0.1:$PORT:$PORT"); fi
 
 # --user keeps files written to the mounted project owned by you, not root.
+# PYTHONPATH: finetune/ lives at the repo root, the apps (agent, ops_crew, refiner) under apps/.
 # HF_HOME/HOME point at writable paths since the mapped uid has no home dir;
 # USER covers libraries that look up the user name (the uid has no passwd entry).
 exec $DOCKER run --rm "${TTY_FLAGS[@]}" --gpus all --ipc=host \
   --user "$(id -u):$(id -g)" \
-  -e HOME=/tmp -e HF_HOME=/hf -e USER="$(id -un)" \
+  -e HOME=/tmp -e HF_HOME=/hf -e USER="$(id -un)" -e PYTHONPATH=/workspace:/workspace/apps \
   -v "$PWD":/workspace \
   -v "$HF_CACHE":/hf \
   "${PORT_FLAGS[@]}" \
