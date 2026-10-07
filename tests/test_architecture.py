@@ -25,7 +25,7 @@ def package_dir(name):
 def imported_modules(*modules):
     code = (f"import sys; import {', '.join(modules)}; "
             "print('\\n'.join(sorted(m for m in sys.modules)))")
-    env = {**os.environ, "PYTHONPATH": os.pathsep.join([str(ROOT), str(APPS)])}
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join([str(ROOT), str(APPS), str(ROOT / "model_serving" / "src")])}
     out = subprocess.run([sys.executable, "-c", code], cwd=ROOT, env=env, capture_output=True, text=True, check=True)
     return set(out.stdout.split())
 
@@ -156,3 +156,34 @@ def test_only_the_ops_crew_adapter_imports_refiner():
             if rel == "apps/ops_crew/refinement.py":
                 continue
             assert not any(n.split(".")[0] == "refiner" for n in _imports_of(path)), f"{rel} imports refiner"
+
+
+# ------------------------------------------------------------- model_serving
+
+SERVING = ROOT / "model_serving" / "src" / "model_serving"
+PROJECT_PACKAGES = ("finetune", "agent", "ops_crew", "refiner")
+
+
+def test_model_serving_is_self_contained():
+    """Its own image: it must not import the training code or the apps."""
+    assert SERVING.is_dir()
+    for path in SERVING.rglob("*.py"):
+        bad = [n for n in _imports_of(path) if n.split(".")[0] in PROJECT_PACKAGES]
+        assert not bad, f"{path.relative_to(ROOT)} imports {bad}"
+
+
+def test_nothing_imports_model_serving():
+    """Other components reach the server over HTTP only."""
+    for package in PROJECT_PACKAGES:
+        for path in package_dir(package).rglob("*.py"):
+            bad = [n for n in _imports_of(path) if n.split(".")[0] == "model_serving"]
+            assert not bad, f"{path.relative_to(ROOT)} imports {bad}"
+
+
+@pytest.mark.parametrize("module", [
+    "model_serving.config", "model_serving.download", "model_serving.api.schemas", "model_serving.api.app",
+    "model_serving.check", "model_serving.backends", "model_serving.engines.base",
+    "model_serving.engines.toolcalls", "model_serving.engines.fake", "model_serving.__main__",
+])
+def test_light_serving_modules_do_not_import_ml_libraries(module):
+    assert not heavy(imported_modules(module)), f"{module} pulls in torch/transformers"

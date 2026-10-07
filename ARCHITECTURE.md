@@ -5,8 +5,9 @@ others: the training engine (TRL → Unsloth), the inference runtime (own server
 Ollama) and the apps that use the model. [apps/ROADMAP.md](apps/ROADMAP.md) tracks feature progress,
 [PROCESS.md](PROCESS.md) the decisions taken so far.
 
-> Status: **phases 1–2 done** (rename `qwen_ft` → `finetune`, apps under `apps/`, model profiles,
-> `TrainingEngine` port). The other phases in section 6 follow, each with the full test suite green.
+> Status: **phases 1–3 done** (rename `qwen_ft` → `finetune`, apps under `apps/`, model profiles,
+> `TrainingEngine` port, self-contained `model_serving/`). The other phases in section 6 follow,
+> each with the full test suite green.
 
 ---
 
@@ -102,7 +103,7 @@ LoRA target layers), recorded in `run_info.json`. Unchanged: `data/` (schema, va
 | Port | Adapters | Notes |
 |---|---|---|
 | `ModelSource.fetch(spec) -> path` | Hugging Face Hub, local directory | download only, no torch needed |
-| `InferenceEngine.chat/stream(request)` | `TransformersEngine` (today), `FakeEngine` (tests) | vLLM and Ollama replace the **whole server**, not this port |
+| `InferenceEngine.generate/stream(request)` | `TransformersEngine` (today), `FakeEngine` (tests) | vLLM and Ollama replace the **whole server**, not this port |
 
 ### `apps`
 | App | Port it depends on | Adapters |
@@ -141,7 +142,7 @@ training code. A cross-component test checks that `model_serving`'s Qwen3
 |---|---|---|
 | 1 ✅ | Rename `qwen_ft` → `finetune` (model-agnostic name); in-process LLM profile `qwen_ft` → `finetuned`. Move `agent/`, `ops_crew/`, `refiner/`, `requirements-crew.txt` (→ `apps/requirements.txt`), `ROADMAP.md` into `apps/`. Add `apps` to PYTHONPATH (`pytest.ini`, `run.sh`). Imports and commands stay the same (`python -m ops_crew`). | none |
 | 2 ✅ | `finetune`: model profiles (`config/models.yaml`: chat_template_kwargs, LoRA target modules per model family), extract `TrainingEngine` port, current trainer becomes `TrlEngine`, `--engine trl` (default), `run_info.json` records the engine. | none |
-| 3 | `model_serving/`: config, download, OpenAI API, transformers engine, streaming, tools, contract check, own requirements, Dockerfile, run script. | new component |
+| 3 ✅ | `model_serving/`: config, download, OpenAI API, transformers engine, streaming, tools, contract check, own requirements, Dockerfile, run script. | new component |
 | 4 | `apps/chat_ui` as an OpenAI API client (UI moved from `finetune/serving`), `agent` `OpenAIBackend`, `finetune chat`/`serve` deprecated then removed. | chat goes through the server |
 | 5 | Architecture tests for the new rules, cross-component consistency tests, docs. | none |
 | later | `UnslothEngine`, vLLM / Ollama runtime switch (URL only), GGUF export for Ollama. | adapters only |

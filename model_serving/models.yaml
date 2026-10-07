@@ -1,0 +1,25 @@
+# Models this server can serve. One process serves one model (like vLLM): pick it with
+#   python -m model_serving serve --model <name>
+#
+# source:               Hugging Face id, or a directory (a fine-tuned output from finetune/).
+#                       run.sh mounts the project's outputs/ at /models/outputs (read-only).
+# chat_template_kwargs: template variables for this model family. Leave unset for a fine-tuned
+#                       output: they are then read from its run_info.json (written by training).
+# max_tokens_limit:     hard cap per request, protects the GPU. The generation policy itself
+#                       (max_tokens, temperature, ...) is chosen by the caller in every request.
+# dtype:                auto (bf16 on GPU, fp32 on CPU) | bfloat16 | float16 | float32
+
+models:
+  qwen3-0.6b:
+    source: Qwen/Qwen3-0.6B
+    chat_template_kwargs: {enable_thinking: false}
+    max_tokens_limit: 2048
+
+  qwen3-ft:
+    source: /models/outputs/qwen3-ft
+    max_tokens_limit: 2048
+
+  qwen2.5-7b-instruct-awq:
+    source: Qwen/Qwen2.5-7B-Instruct-AWQ   # needs autoawq; usually better served by vLLM (see README)
+    chat_template_kwargs: {}
+    max_tokens_limit: 4096

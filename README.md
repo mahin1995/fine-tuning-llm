@@ -27,6 +27,11 @@ finetune/                   CORE: data -> train -> evaluate      -> python -m fi
   serving/                  app (FastAPI, model injected) + static/index.html   (moves to apps/chat_ui)
   cli/                      one module per command; the only place that wires packages together
 
+model_serving/              SERVING: download + OpenAI-compatible API, own requirements/Dockerfile/run.sh
+  models.yaml               served models: source, chat_template_kwargs, max_tokens_limit
+  src/model_serving/        config, download, engines/ (transformers, fake), api/, check, backends
+  README.md                 commands, API, moving to vLLM / Ollama   -> python -m model_serving <command>
+
 apps/                       APPS: everything that uses a model (on PYTHONPATH, see below)
   requirements.txt          crewai, pydantic-ai, pydantic-settings
   ROADMAP.md                learning levels: what is done, where, what is next
@@ -46,7 +51,8 @@ tests/                      CPU tests (tiny local Qwen3 model, scripted LLMs for
 ```
 
 **Running outside Docker:** the apps live under `apps/`, so put both roots on the path:
-`export PYTHONPATH=.:apps` (`run.sh` and `pytest.ini` already do this).
+`export PYTHONPATH=.:apps` (`run.sh` and `pytest.ini` already do this). `pytest.ini` also adds
+`model_serving/src`, so one `python -m pytest` runs every component's tests.
 
 ### Dependency rules (enforced by `tests/test_architecture.py`)
 
@@ -63,11 +69,13 @@ tests/                      CPU tests (tiny local Qwen3 model, scripted LLMs for
 | `agent/backends/qwen.py`, `agent/__main__.py` | `finetune` (the only bridge) |
 | `refiner` | only `pydantic` / `pydantic_ai` (no project package) |
 | `ops_crew/refinement.py` | `refiner` (the only module that may) |
+| `model_serving` | nothing from the project (self-contained; nothing imports it either) |
 
 `finetune` never imports `agent`. `ops_crew.domain` imports no CrewAI and only reuses
 `finetune.data`; only `ops_crew/crew/`, `flow.py`, `evals/` and `__main__` import CrewAI;
 `finetune`, `agent` and `ops_crew` never import each other sideways. Lightweight modules (`data`, `config`, `modeling.params`, `evaluation`, `serving.app`,
-`training.options`, the CLI dispatcher) must not import torch/transformers; tests check this too.
+`training.options`, the CLI dispatcher, and every `model_serving` module except
+`engines/transformers_engine.py`) must not import torch/transformers; tests check this too.
 
 ## Quick start
 
@@ -87,6 +95,11 @@ PORT=8000 ./run.sh python -m finetune serve --model outputs/qwen3-ft   # http://
 
 ./run.sh python -m agent --model outputs/qwen3-ft "What is 17 * 23?"  # one question
 ./run.sh python -m agent --model Qwen/Qwen3-0.6B                      # interactive
+
+# OpenAI-compatible model server: its own image, see model_serving/README.md
+model_serving/run.sh build
+model_serving/run.sh serve --model qwen3-ft                          # http://localhost:8001/v1
+model_serving/run.sh check --model qwen3-ft                          # contract check
 ```
 
 Smoke test on the 10-example dataset (the defaults give only 3 optimizer steps):
@@ -253,6 +266,10 @@ python -m finetune train --engine trl                                        # e
   the agent takes a `ChatBackend`. Tests swap in fakes; the CLI wires real objects.
 
 ## API
+
+The OpenAI-compatible API (`/v1/chat/completions`, streaming, tool calls) is served by
+`model_serving` (see [model_serving/README.md](model_serving/README.md)). The older `/chat`
+endpoint below (`finetune serve`) moves to `apps/chat_ui` as an API client in phase 4.
 
 ```bash
 curl -s localhost:8000/chat -H 'Content-Type: application/json' -d '{

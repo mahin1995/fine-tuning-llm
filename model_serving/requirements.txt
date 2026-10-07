@@ -1,0 +1,14 @@
+# model_serving's own dependencies: independent of the training image (../requirements.txt)
+# and the apps (../apps/requirements.txt). Pinned so the API matches the code.
+# torch is NOT listed: it comes from the pytorch/pytorch base image (CUDA build) and the
+# Dockerfile constrains pip so nothing can replace it.
+transformers==5.17.0
+peft==0.21.0               # LoRA outputs are merged on load
+huggingface_hub==1.33.0    # download
+fastapi==0.142.2
+uvicorn[standard]==0.54.0
+PyYAML==6.0.3              # models.yaml
+
+# tests (small; kept in the image so ./run.sh test works)
+pytest==9.1.1
+httpx==0.28.1

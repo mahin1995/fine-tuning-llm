@@ -8,6 +8,8 @@ README.md has the layout and commands, ARCHITECTURE.md the component design and 
 PROCESS.md the decision log, apps/ROADMAP.md the learning-level progress.
 Layout: `finetune/` (core) at the root; `agent/`, `ops_crew/`, `refiner/` under `apps/`, which is on
 PYTHONPATH (`pytest.ini`, `run.sh`), so imports stay `import ops_crew`. Outside Docker: `export PYTHONPATH=.:apps`.
+`model_serving/` (download + OpenAI-compatible server) is a self-contained component with its own
+requirements, Dockerfile and `run.sh`; its code is in `model_serving/src` (on pytest's pythonpath).
 
 ## Commands
 - Tests (CPU, no network, ~30s): `python -m pytest` (or `./run.sh python -m pytest` in Docker)
@@ -26,6 +28,8 @@ PYTHONPATH (`pytest.ini`, `run.sh`), so imports stay `import ops_crew`. Outside 
 - `ops_crew/domain/` is plain Python: no CrewAI, and from `finetune` only `finetune.data`. Only
   `ops_crew/crew/`, `flow.py`, `evals/` and `__main__.py` import CrewAI. `finetune`, `agent` and
   `ops_crew` never import each other sideways.
+- `model_serving` imports nothing from `finetune`/`apps`, and nothing imports it (HTTP only). Only
+  `engines/transformers_engine.py` may import torch/transformers at module level.
 - `refiner/` imports only pydantic / pydantic_ai (it is domain-agnostic). Only
   `ops_crew/refinement.py` imports `refiner`; the flow talks to it through `domain.ports.Refiner`.
 
@@ -46,6 +50,15 @@ PYTHONPATH (`pytest.ini`, `run.sh`), so imports stay `import ops_crew`. Outside 
   built-in tools.
 - Don't commit `outputs/` or weights (`.gitignore`).
 - Tests use a tiny locally built Qwen3 model (`tests/conftest.py`); keep them network-free.
+
+## model_serving rules
+- Generation policy (`max_tokens`, temperature, ...) comes from the caller; the server only caps
+  `max_tokens` at the model's `max_tokens_limit` (header `X-Max-Tokens-Limited`), never rejects it.
+- `models.yaml` `chat_template_kwargs` must match `finetune/model_profiles.yaml` for the same family
+  (cross-component test); fine-tuned outputs leave it unset and use their `run_info.json`.
+- Keep the API OpenAI-compatible so vLLM / Ollama stay drop-in; `python -m model_serving check` is the contract.
+- Pins in `model_serving/requirements.txt` are separate from the root ones; keep shared libraries
+  (transformers, peft) on the same version as training unless there is a reason not to.
 
 ## ops_crew rules
 - The LLM only proposes. Authorization, business rules and execution live in `ops_crew/domain/`;

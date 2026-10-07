@@ -350,16 +350,40 @@ tends to reproduce the same invalid output.
 - No behaviour change for Qwen3: same `enable_thinking=False`, same LoRA layers. 282 tests
   pass (27 new), including a fake engine plugged in with no change to callers.
 
+## Step 15 — `model_serving` component (ARCHITECTURE.md phase 3) *(written, tested on CPU)*
+
+- New self-contained folder `model_serving/`: own `requirements.txt`, `Dockerfile` (image
+  `model-serving`, non-root, port 8001), `run.sh`, `models.yaml` and `README.md`. It imports
+  nothing from `finetune` or `apps` (model loading is re-implemented on purpose), so the serving
+  image never carries the training code.
+- **OpenAI-compatible API**: `/health`, `/v1/models`, `/v1/chat/completions` with SSE
+  streaming, Hermes `<tool_call>` → `tool_calls`, OpenAI error format, optional bearer auth.
+  `max_tokens` comes from the caller; the server caps it at `max_tokens_limit` and says so in a
+  header instead of rejecting the request.
+- **Engines** behind an `InferenceEngine` port: `TransformersEngine` (full or LoRA, merged on
+  load; stop strings held back across stream chunks) and `FakeEngine` (tests, `--engine fake`).
+- `chat_template_kwargs` per model: `models.yaml`, else the fine-tuned output's `run_info.json`.
+  A cross-component test checks they match `finetune/model_profiles.yaml`.
+- **Contract check** (`python -m model_serving check`, standard library only) runs the same five
+  checks against this server, vLLM or Ollama. `vllm-command` prints the matching vLLM docker
+  command, `ollama-help` the GGUF steps.
+- Tested: 33 component tests, 9 integration tests (the real transformers engine on the tiny
+  model, the official OpenAI SDK as client), 12 architecture tests; a fake-engine server passed
+  the contract check over real HTTP. Not yet run on the GPU with the real model (no Hub access
+  in the build environment).
+
 ## Tests
 
-`python -m pytest` runs 282 tests offline. The ops_crew tests skip themselves
-when `requirements-crew.txt` isn't installed. They cover:
+`python -m pytest` runs 336 tests offline (including `model_serving/tests`). The ops_crew tests skip themselves
+when `apps/requirements.txt` isn't installed. They cover:
 - **finetune:** data, training (full and LoRA), template consistency, evaluation, serving
 - **agent:** the loop, the parser, tools and calculator safety, Qwen integration
 - **ops_crew:** the domain layer, every flow route with a mocked crew, real CrewAI
   agents on scripted LLMs, evals with an oracle crew
 - **refiner:** self-correction in all output modes, the reflection loop, fallback, local function models
 - **ops_crew + refiner:** every new flow route, the real adapter on FunctionModels
+- **model_serving:** registry, download, tool-call parsing, the API with a fake engine, streaming,
+  the contract check, the transformers engine and the OpenAI SDK as a client
 - **architecture:** package boundaries
 
 ## Open items / decisions made along the way
@@ -367,8 +391,8 @@ when `requirements-crew.txt` isn't installed. They cover:
 - Full fine-tuning remains the default, now with fp32 master weights, bf16 autocast
   and 8-bit AdamW. `--lora` is available and is the safer choice while the
   dataset is small.
-- No GGUF/Ollama step — the fine-tuned model is served directly via
-  `transformers` + FastAPI.
+- No GGUF/Ollama step yet. The fine-tuned model is served by `model_serving` (transformers +
+  FastAPI); vLLM / Ollama are a URL switch after `python -m model_serving check` passes.
 - All project files and the HF model cache live under this project directory
   / the host's `~/.cache/huggingface` (mounted into the container), not
   inside the disposable container filesystem.
