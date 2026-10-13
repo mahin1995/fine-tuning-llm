@@ -5,7 +5,8 @@ level-এর কোন অংশ কোথায় implement করা, আর 
 [PROCESS.md](../PROCESS.md), আর command ও folder layout-এর জন্য [README.md](../README.md) দেখো।
 
 > **শেষ আপডেট:** Level 1 শেষ পর্যায়ে (planning বাকি), Level 3–5-এর কিছু অংশ আগেই হয়ে গেছে।
-> **সতর্কতা:** সব code offline-এ test করা হয়েছে (২৫৫টা test), কিন্তু **আসল LLM দিয়ে এখনও চালানো হয়নি।**
+> Architecture phase 1–3 শেষ (`finetune` core, `apps/`, model profile, `TrainingEngine` port, `model_serving`)।
+> **সতর্কতা:** সব code offline-এ test করা হয়েছে (৩৩৬টা test), কিন্তু **আসল LLM বা GPU দিয়ে এখনও চালানো হয়নি।**
 
 ---
 
@@ -26,12 +27,13 @@ level-এর কোন অংশ কোথায় implement করা, আর 
 ## ২. Project-এর Package আর Feature
 
 ```
-finetune/    fine-tuning harness                   python -m finetune <command>
-agent/      tool-calling agent loop               python -m agent
-ops_crew/   hybrid CrewAI agent (Dataset Ops)     python -m ops_crew "<request>"
-refiner/    self-correction + reflection          (ops_crew/refinement.py থেকে ব্যবহার হয়)
-data/       train.jsonl (10), eval.jsonl (8)
-tests/      255টা offline test + architecture rule
+finetune/            fine-tuning harness (core)            python -m finetune <command>
+model_serving/       model download + OpenAI-compatible API  python -m model_serving <command>
+apps/agent/          tool-calling agent loop               python -m agent
+apps/ops_crew/       hybrid CrewAI agent (Dataset Ops)     python -m ops_crew "<request>"
+apps/refiner/        self-correction + reflection          (ops_crew/refinement.py থেকে ব্যবহার হয়)
+data/                train.jsonl (10), eval.jsonl (8)
+tests/               ৩৩৬টা offline test + architecture rule
 ```
 
 ### `finetune/`: Fine-tuning harness
@@ -43,7 +45,18 @@ tests/      255টা offline test + architecture rule
 | Evaluation: base বনাম fine-tuned (answer loss + পাশাপাশি উত্তর) | `finetune/evaluation/` |
 | Terminal chat (streaming) | `finetune/cli/chat.py` |
 | FastAPI `/chat` + browser UI | `finetune/serving/` |
+| Training engine port (`--engine trl`, পরে Unsloth), `run_info.json`-এ engine ও profile | `finetune/training/engine.py`, `trl_engine.py` |
 | Docker (pinned version, torch-এর CUDA build সুরক্ষিত) | `Dockerfile`, `run.sh`, `requirements.txt` |
+
+### `model_serving/`: Model download + serving (আলাদা component, আলাদা image)
+| Feature | কোথায় |
+|---|---|
+| Model registry (source, chat_template_kwargs, max_tokens_limit) | `model_serving/models.yaml`, `src/model_serving/config.py` |
+| Hugging Face থেকে download বা local fine-tuned output | `src/model_serving/download.py` |
+| OpenAI-compatible API: streaming, tool calling, auth, `max_tokens` cap | `src/model_serving/api/` |
+| Engine port: transformers (full / LoRA), fake (test) | `src/model_serving/engines/` |
+| Contract check (নিজের server, vLLM, Ollama) + vLLM / Ollama-তে যাওয়ার নির্দেশ | `check.py`, `backends.py` |
+| নিজস্ব Docker image | `model_serving/Dockerfile`, `run.sh`, `requirements.txt` |
 
 ### `agent/`: Tool-calling agent loop (model-agnostic)
 | Feature | কোথায় |
@@ -61,7 +74,7 @@ tests/      255টা offline test + architecture rule
 |---|---|
 | CrewAI Flow: intake → crew → validate → reflect → authorize → approve → execute → audit | `ops_crew/flow.py` |
 | ৩-agent sequential crew (Classifier, Researcher, Reviewer) | `ops_crew/crew/`, `config/agents.yaml`, `tasks.yaml` |
-| Multi-LLM profile (local, OpenAI, Anthropic, finetune), প্রতিটা agent-এ আলাদা, fallback সহ | `ops_crew/crew/llm.py`, `config/llms.yaml` |
+| Multi-LLM profile (local, OpenAI, Anthropic, finetuned), প্রতিটা agent-এ আলাদা, fallback সহ | `ops_crew/crew/llm.py`, `config/llms.yaml` |
 | Read-only, traced tool | `ops_crew/crew/tools.py` |
 | Role ও business rule (plain Python) | `ops_crew/domain/policy.py` |
 | Idempotency key, atomic write | `ops_crew/domain/idempotency.py`, `actions.py`, `repository.py` |
@@ -149,6 +162,8 @@ tests/      255টা offline test + architecture rule
 | `ops_crew/domain/` plain Python (CrewAI নেই) | একই |
 | `refiner` শুধু pydantic / pydantic_ai import করে | একই |
 | `finetune`, `agent` আর `ops_crew` একে অপরকে import করে না | একই |
+| `model_serving` project-এর কিছু import করে না, কেউ তাকেও import করে না (শুধু HTTP) | একই |
+| Serving আর training-এর `chat_template_kwargs` মেলে | `tests/test_model_serving_integration.py` |
 
 ---
 
@@ -170,7 +185,8 @@ tests/      255টা offline test + architecture rule
 6. **Level 5:** OpenTelemetry tracing, telemetry metric, security hardening
 7. **Fine-tuning-এর লক্ষ্য পূরণ**
    - Dataset ১০ থেকে ৫০০+ example-এ নেওয়া (`ops_crew` দিয়েই curate করা যায়)
-   - Distillation: বড় model-এর সফল crew transcript দিয়ে 0.6B-কে LoRA train, তারপর `OPS_LLM_PROFILE=finetune` দিয়ে eval তুলনা
+   - Distillation: বড় model-এর সফল crew transcript দিয়ে 0.6B-কে LoRA train, তারপর `OPS_LLM_PROFILE=finetuned` দিয়ে eval তুলনা
+8. **Architecture phase 4–5:** `apps/chat_ui` (OpenAI API client), agent-এর `OpenAIBackend`, `finetune chat`/`serve` সরানো
 
 ---
 
@@ -195,4 +211,6 @@ tests/      255টা offline test + architecture rule
 ./run.sh python -m agent --help                  # agent loop
 ./run.sh python -m ops_crew --help               # hybrid agent
 ./run.sh python -m ops_crew.evals --help         # eval
+model_serving/run.sh serve --model qwen3-0.6b    # OpenAI-compatible server (127.0.0.1:8001)
+model_serving/run.sh check --model qwen3-0.6b    # contract check
 ```
