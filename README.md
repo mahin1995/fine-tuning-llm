@@ -278,3 +278,9 @@ curl -s localhost:8000/chat -H 'Content-Type: application/json' -d '{
 }'
 # {"reply": "..."}
 ```
+
+## Learning resources
+
+The AI agent learning levels (LEVEL 1–5) tracked in [apps/ROADMAP.md](apps/ROADMAP.md) follow this video:
+
+- [AI agent learning levels (YouTube)](https://www.youtube.com/watch?v=3sez6YA_g2Y)
