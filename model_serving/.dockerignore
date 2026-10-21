@@ -1,0 +1,7 @@
+# Only the component itself goes into the image.
+*
+!requirements.txt
+!models.yaml
+!src/
+!tests/
+**/__pycache__
