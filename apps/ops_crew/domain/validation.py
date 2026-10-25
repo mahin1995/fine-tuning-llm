@@ -5,13 +5,18 @@ from dataclasses import dataclass, field
 
 from pydantic import BaseModel, ValidationError
 
-from ops_crew.schemas import ActionProposal, ClassifiedRequest, CrewRun, ResearchFindings, ValidatedRun
+from ops_crew.schemas import ActionProposal, ClassifiedRequest, CrewRun, Plan, ResearchFindings, ValidatedRun
 
 # Task name in tasks.yaml -> schema its output must satisfy.
 TASK_SCHEMAS: dict[str, type[BaseModel]] = {
     "classify_request": ClassifiedRequest,
     "research_context": ResearchFindings,
     "review_proposal": ActionProposal,
+}
+
+# The planner's single task (planner.yaml) runs in its own one-agent crew, before the crew above.
+PLANNER_TASK_SCHEMAS: dict[str, type[BaseModel]] = {
+    "plan_request": Plan,
 }
 
 _FENCE = re.compile(r"^```(?:json)?\s*(.*?)\s*```$", re.DOTALL)

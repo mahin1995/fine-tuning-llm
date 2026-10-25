@@ -1,8 +1,8 @@
-"""What the deterministic flow needs from the probabilistic layers (crew, refiner)."""
+"""What the deterministic flow needs from the probabilistic layers (planner, crew, refiner)."""
 from dataclasses import dataclass, field
 from typing import Protocol
 
-from ops_crew.schemas import ActionProposal, ClassifiedRequest, CrewRun, ResearchFindings
+from ops_crew.schemas import ActionProposal, ClassifiedRequest, CrewRun, Plan, ResearchFindings
 
 
 class ProposerError(RuntimeError):
@@ -12,6 +12,17 @@ class ProposerError(RuntimeError):
 class Proposer(Protocol):
     def propose(self, request: str, correlation_id: str) -> CrewRun:
         """Run the crew on one request. Must not have side effects. Raises ProposerError."""
+        ...
+
+
+class PlannerError(RuntimeError):
+    """The planner could not produce output: provider failure, timeout, ..."""
+
+
+class Planner(Protocol):
+    def plan(self, request: str, correlation_id: str) -> str:
+        """Split one request into steps. Returns the raw output; the flow validates it against
+        schemas.Plan and domain/planning.py. Must not have side effects. Raises PlannerError."""
         ...
 
 
@@ -29,6 +40,13 @@ class RepairRequest:
 
 
 @dataclass(frozen=True)
+class PlanRepairRequest:
+    request: str                      # cleaned user request (untrusted)
+    previous_output: str              # the planner's raw or re-serialised plan (untrusted)
+    problems: list[str]               # written by our code (domain/planning.py, validation): safe to show
+
+
+@dataclass(frozen=True)
 class ReflectionOutcome:
     proposal: ActionProposal          # best version (unchanged if nothing better was found)
     score: float | None               # None: the critic could not run
@@ -43,6 +61,10 @@ class Refiner(Protocol):
 
     def repair(self, req: RepairRequest) -> ActionProposal:
         """Fix the listed problems with feedback-driven retries. Raises RefinementError."""
+        ...
+
+    def repair_plan(self, req: PlanRepairRequest) -> Plan:
+        """Fix a plan's structural problems (domain/planning.plan_problems). Raises RefinementError."""
         ...
 
     def review_answer(self, request: str, proposal: ActionProposal, findings: ResearchFindings) -> ReflectionOutcome:

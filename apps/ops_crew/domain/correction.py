@@ -17,7 +17,8 @@ from ops_crew.schemas import ActionProposal, ClassifiedRequest, Intent, Research
 REFLECTED_INTENTS = {Intent.ASK, Intent.ADD_EXAMPLE}
 
 
-def _norm(text: str) -> str:
+def normalize(text: str) -> str:
+    """Whitespace- and case-insensitive form used for every "copied verbatim" check."""
     return " ".join(text.split()).lower()
 
 
@@ -30,10 +31,10 @@ def correctable_problems(proposal: ActionProposal, classification: ClassifiedReq
     if proposal.intent == Intent.ASK and not (proposal.answer and proposal.answer.strip()):
         problems.append("intent is 'ask' but `answer` is empty; write the answer using the research")
     if proposal.intent == Intent.ADD_EXAMPLE:
-        source = _norm(request)
+        source = normalize(request)
         for name in ("question", "answer"):
             value = getattr(proposal.params, name)
-            if value and _norm(value) not in source:
+            if value and normalize(value) not in source:
                 problems.append(f"params.{name} must be copied verbatim from the request, not rewritten")
     if proposal.intent == Intent.REMOVE_EXAMPLE and proposal.params.example_id:
         known = set(findings.related_example_ids) | ({findings.duplicate_of} if findings.duplicate_of else set())

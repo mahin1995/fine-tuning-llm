@@ -4,10 +4,12 @@ Every crew output is parsed into one of these models; anything that doesn't
 validate is rejected (and retried / escalated) before any decision is made.
 """
 from enum import StrEnum
+from typing import Annotated
 
 from pydantic import BaseModel, ConfigDict, Field
 
 EXAMPLE_ID_PATTERN = r"^[0-9a-f]{12}$"
+STEP_ID_PATTERN = r"^s[1-9][0-9]?$"  # s1 .. s99; ids are echoed in feedback, so they must stay this simple
 
 
 class Intent(StrEnum):
@@ -60,6 +62,24 @@ class ActionProposal(_Strict):
     issues: list[str] = Field(default_factory=list)  # gaps / contradictions the reviewer found
     confidence: float = Field(ge=0.0, le=1.0)
     clarifying_question: str | None = None
+
+
+StepId = Annotated[str, Field(pattern=STEP_ID_PATTERN)]
+
+
+class PlanStep(_Strict):
+    """One step of a plan: a part of the user's request, copied verbatim, and its intent."""
+    id: StepId
+    intent: Intent
+    excerpt: str = Field(min_length=1, max_length=4000)  # verbatim from the request: the planner writes no content
+    depends_on: list[StepId] = Field(default_factory=list)  # earlier steps that must complete first
+
+
+class Plan(_Strict):
+    """Output of the Planner: the request split into ordered steps. Never executed directly;
+    domain/planning.py checks it and every step still goes through the normal pipeline."""
+    steps: list[PlanStep] = Field(min_length=1, max_length=20)  # the real limit is a policy (max_plan_steps)
+    rationale: str = ""
 
 
 class ToolCallRecord(_Strict):
