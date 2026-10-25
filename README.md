@@ -39,10 +39,11 @@ apps/                       APPS: everything that uses a model (on PYTHONPATH, s
     loop.py, tools.py, parser.py, builtin_tools.py, backend.py (ChatBackend port)
     backends/qwen.py        adapter to finetune's ChatModel: the only bridge between the two
   ops_crew/                 hybrid CrewAI agent: Dataset Ops Assistant  -> python -m ops_crew "<request>"
-    schemas.py, settings.py, config/ (agents, tasks, llms, refine .yaml)
-    domain/                 deterministic layer, plain Python (no CrewAI)
-    flow.py                 CrewAI Flow: intake -> crew -> validate -> authorize -> approve -> execute
-    crew/                   3-agent sequential crew, read-only tools, LLM factory with fallbacks
+    schemas.py, settings.py, config/ (agents, tasks, planner, llms, refine .yaml)
+    domain/                 deterministic layer, plain Python (no CrewAI), incl. planning.py (plan checks + gate)
+    flow.py                 CrewAI Flows: OpsFlow (intake -> crew -> validate -> authorize -> approve -> execute)
+                            and PlanFlow (plan -> gate -> run each step through OpsFlow)
+    crew/                   3-agent sequential crew, planner agent, read-only tools, LLM factory with fallbacks
     evals/                  14 golden cases + runner         -> python -m ops_crew.evals
     refinement.py           adapter to `refiner` (the only module that imports it)
   refiner/                  generic self-correction + reflection on PydanticAI (domain-agnostic)
@@ -170,15 +171,38 @@ Intent Classifier (no tools) -> Dataset Researcher (search, get, duplicate, eval
 -> Proposal Reviewer (get, duplicate). Sequential because the work is a fixed pipeline; a hierarchical
 manager would add LLM calls and unpredictability for no gain.
 
+**Planning** (plan-and-execute; on by default, `OPS_PLANNING=false` turns it off). A request with several
+actions ("Remove the N+1 example and add this improved version: Q: ... A: ...") is first split by a planner
+agent (`config/planner.yaml`, no tools) into a typed `Plan`: steps with one intent each, a verbatim excerpt
+of the request, and `depends_on` (earlier steps only). The planner only proposes; `domain/planning.py` decides:
+
+```
+intake ─► make_plan (planner + checks) ─► gate_plan ─┬─ plan_denied ─────────► reject_plan
+                                                     ├─ plan_allowed ────────► run_steps (each step = the pipeline above)
+                                                     └─ plan_needs_approval ─► request_plan_approval ─► run_steps / decline_plan
+```
+
+- **Structure:** every excerpt must be the user's own words, so a plan can never add content. A broken plan
+  is repaired by the refiner (or the planner is asked again); without a usable plan the request takes the
+  one-intent path above. A one-step plan is exactly that path.
+- **Plan gate, before any side effect:** one forbidden step rejects the whole plan; more than
+  `OPS_MAX_PLAN_STEPS` (4) actions are rejected; a multi-step plan that changes data is approved as a whole.
+- **Steps** run in order through the pipeline above, on their original text, so every rule still applies per
+  step (a destructive step still asks for approval with its concrete id). A step whose dependency did not
+  complete is skipped; a step whose crew proposes a different intent than planned escalates.
+- **Result:** `completed`, `partially_completed` (no rollback) or the first failing step's outcome;
+  audit records use `<id>.s1`, `<id>.s2` under the request's correlation id.
+
 **Multi-LLM** (`ops_crew/config/llms.yaml`): profiles `local` (any OpenAI-compatible server: Ollama, vLLM, ...),
-`openai`, `anthropic`, `finetune` (this repo's model, experimental). Per agent:
-`OPS_LLM_PROFILE_<AGENT>` > `OPS_LLM_PROFILE` > `llm:` in agents.yaml. Profiles list `fallbacks` that are tried
+`openai`, `anthropic`, `finetuned` (this repo's model, experimental). Per agent (and the planner):
+`OPS_LLM_PROFILE_<AGENT>` > `OPS_LLM_PROFILE` > `llm:` in agents.yaml / planner.yaml. Profiles list `fallbacks` that are tried
 when a provider fails (skipped if their key isn't set). Keys come only from env vars named in the profile.
 
 ```bash
 ./run.sh python -m ops_crew "How many examples are in the training data?"
 ./run.sh python -m ops_crew --role editor "Add Q: What is a Spring profile? A: A named set of beans ..."
 ./run.sh python -m ops_crew --role admin "Remove the example about bean scopes"     # asks for approval
+./run.sh python -m ops_crew --role admin "Remove the N+1 example and add: Q: ... A: ..."   # planned: 2 steps
 OPS_LLM_PROFILE=openai OPENAI_API_KEY=... ./run.sh python -m ops_crew.evals --report outputs/ops/evals.json
 OPS_LLM_PROFILE_REVIEWER=anthropic ANTHROPIC_API_KEY=... ./run.sh python -m ops_crew "..."   # mix providers
 ```
@@ -196,6 +220,9 @@ Idempotency store: `outputs/ops/idempotency.jsonl`; pass `--request-id` to scope
 | Prompt injection | Delimited, neutralised user and tool text; read-only tools; role from caller; markers force approval for side effects |
 | Low confidence | Clarifying question, or escalation if there is none |
 | LLM provider failure | Provider fallback chain, then retry, then escalation; missing keys fail at startup |
+| Several actions in one request | Planner splits them into steps; plan gate first, then the full pipeline per step |
+| Planner rewrites or invents text | Excerpts must match the request; steps run on the user's original text |
+| Step fails halfway through a plan | Its dependents are skipped, independent steps run, the result says which (no rollback) |
 
 ## Self-correction and reflection (`refiner` + `ops_crew/refinement.py`)
 
@@ -216,8 +243,10 @@ crew proposal ─► validate each task output ─► correctable problem? ─ye
 ```
 
 - **Correctable** (fed back to the model): malformed JSON / schema errors, empty answer, add params
-  not copied verbatim, an example id the research never found, an unexplained intent change.
-- **Final** (no retry, policy decides): role denials, duplicates, eval-set leakage, unsupported intents.
+  not copied verbatim, an example id the research never found, an unexplained intent change, and a
+  plan's structure (excerpt not verbatim, overlapping steps, `depends_on` on a later or unknown step).
+- **Final** (no retry, policy decides): role denials, duplicates, eval-set leakage, unsupported intents,
+  a plan with too many steps or a forbidden step. A failed plan step is never re-planned by the model.
 - Feedback texts are written by code, never copied from user or tool text; untrusted text in
   prompts is delimited and its tags neutralised.
 - Reflection is a quality gate, not a single point of failure: if the critic is down, answers

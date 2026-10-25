@@ -8,9 +8,11 @@ Layers (dependency direction: crew -> domain, flow -> domain + ports; domain imp
     settings.py  configuration from env (OPS_*), no secrets in code
     domain/      deterministic layer, plain Python: validation, policy (authorization +
                  business rules), idempotency, approval, audit log, dataset repository, executor
-    flow.py      CrewAI Flow wiring the fixed pipeline: intake -> crew -> validate ->
-                 authorize -> (approve) -> execute -> audit
-    crew/        probabilistic layer: 3-agent sequential crew, read-only tools, multi-LLM profiles
+    flow.py      CrewAI Flows: OpsFlow wires the fixed pipeline (intake -> crew -> validate ->
+                 authorize -> (approve) -> execute -> audit); PlanFlow plans first and runs
+                 every step of the plan through OpsFlow
+    crew/        probabilistic layer: 3-agent sequential crew, planner agent, read-only tools,
+                 multi-LLM profiles
     evals/       golden cases + runner for the crew (needs a real LLM)
 
 Run: python -m ops_crew --role editor "add this Q&A to the training data: ..."

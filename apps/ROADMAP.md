@@ -4,9 +4,9 @@
 level-এর কোন অংশ কোথায় implement করা, আর কী বাকি। খুঁটিনাটি design decision-এর জন্য
 [PROCESS.md](../PROCESS.md), আর command ও folder layout-এর জন্য [README.md](../README.md) দেখো।
 
-> **শেষ আপডেট:** Level 1 শেষ পর্যায়ে (planning বাকি), Level 3–5-এর কিছু অংশ আগেই হয়ে গেছে।
+> **শেষ আপডেট:** Level 1-এর সব অংশ implement হয়েছে (শেষ ধাপ: Task Decomposition & Planning)। Level 3–5-এর কিছু অংশ আগেই হয়ে গেছে।
 > Architecture phase 1–3 শেষ (`finetune` core, `apps/`, model profile, `TrainingEngine` port, `model_serving`)।
-> **সতর্কতা:** সব code offline-এ test করা হয়েছে (৩৩৬টা test), কিন্তু **আসল LLM বা GPU দিয়ে এখনও চালানো হয়নি।**
+> **সতর্কতা:** সব code offline-এ test করা হয়েছে (৪০৩টা test), কিন্তু **আসল LLM বা GPU দিয়ে এখনও চালানো হয়নি।**
 
 ---
 
@@ -33,7 +33,7 @@ apps/agent/          tool-calling agent loop               python -m agent
 apps/ops_crew/       hybrid CrewAI agent (Dataset Ops)     python -m ops_crew "<request>"
 apps/refiner/        self-correction + reflection          (ops_crew/refinement.py থেকে ব্যবহার হয়)
 data/                train.jsonl (10), eval.jsonl (8)
-tests/               ৩৩৬টা offline test + architecture rule
+tests/               ৪০৩টা offline test + architecture rule
 ```
 
 ### `finetune/`: Fine-tuning harness
@@ -74,13 +74,15 @@ tests/               ৩৩৬টা offline test + architecture rule
 |---|---|
 | CrewAI Flow: intake → crew → validate → reflect → authorize → approve → execute → audit | `ops_crew/flow.py` |
 | ৩-agent sequential crew (Classifier, Researcher, Reviewer) | `ops_crew/crew/`, `config/agents.yaml`, `tasks.yaml` |
+| Planner: একাধিক কাজের request-কে ধাপে ভাগ করা (plan-and-execute) | `config/planner.yaml`, `crew/planner.py`, `flow.py` (`PlanFlow`) |
+| Plan-এর নিয়ম: হুবহু excerpt, ধাপের নির্ভরতা, plan gate (role, ধাপের সীমা, পুরো plan-এর approval) | `ops_crew/domain/planning.py` |
 | Multi-LLM profile (local, OpenAI, Anthropic, finetuned), প্রতিটা agent-এ আলাদা, fallback সহ | `ops_crew/crew/llm.py`, `config/llms.yaml` |
 | Read-only, traced tool | `ops_crew/crew/tools.py` |
 | Role ও business rule (plain Python) | `ops_crew/domain/policy.py` |
 | Idempotency key, atomic write | `ops_crew/domain/idempotency.py`, `actions.py`, `repository.py` |
 | Human approval | `ops_crew/domain/approval.py` |
 | Correlation id সহ JSON audit log | `ops_crew/domain/audit.py` |
-| ১৪টা golden eval case + runner | `ops_crew/evals/` |
+| ২০টা golden eval case (৬টা planning-এর) + runner | `ops_crew/evals/` |
 
 ### `refiner/`: Self-correction ও Reflection (PydanticAI, domain-agnostic)
 | Feature | কোথায় |
@@ -101,10 +103,10 @@ tests/               ৩৩৬টা offline test + architecture rule
 |---|---|---|---|
 | Agent Loops | ✅ | `agent/loop.py` (step limit, error feedback, repeat-call dedupe, output truncation) | — |
 | Deterministic vs Probabilistic Decisions | ✅ | `ops_crew/domain/` (code সিদ্ধান্ত নেয়) বনাম `ops_crew/crew/` (LLM প্রস্তাব দেয়) | — |
-| Task Decomposition & Planning | ⚠️ | Crew-এর classify → research → review ভাগ **আগে থেকে ঠিক করা** (`tasks.yaml`) | LLM নিজে plan বানাবে, ধাপের নির্ভরতা থাকবে, fail হলে re-planning |
+| Task Decomposition & Planning | ✅ | Plan-and-execute: planner (`config/planner.yaml`, `crew/planner.py`) typed `Plan` দেয়; `domain/planning.py` structure যাচাই করে আর plan gate চালায়; `PlanFlow` (`flow.py`) প্রতিটা ধাপ পুরো pipeline-এর ভেতর দিয়ে চালায়; plan ভাঙা হলে refiner দিয়ে repair | আসল LLM-এ মাপা; ধাপের মধ্যে data পাঠানো (ReWOO); planned intent crew-কে hint হিসেবে দেওয়া |
 | Self-Correction & Reflection | ✅ | `refiner/`, `ops_crew/domain/correction.py`, `flow.py` (`reflect_on_proposal`) | আসল LLM-এ মাপা |
 
-**Level 1 অগ্রগতি: ~৮৫%**
+**Level 1 অগ্রগতি: ~১০০%** (সব অংশ implement আর offline-এ test করা; আসল LLM-এ মাপা বাকি)
 
 ### LEVEL 2: Context Engineering & AI Agent Memory
 | বিষয় | অবস্থা | কোথায় | বাকি |
@@ -130,7 +132,7 @@ tests/               ৩৩৬টা offline test + architecture rule
 ### LEVEL 4: Multi-Agent Systems & Agent Orchestration
 | বিষয় | অবস্থা | কোথায় | বাকি |
 |---|---|---|---|
-| Orchestrator Agents | ⚠️ | Deterministic orchestrator (CrewAI Flow) | LLM-চালিত orchestrator যে কাজ ভাগ করে agent-দের দেয় |
+| Orchestrator Agents | ⚠️ | Deterministic orchestrator (CrewAI Flow); `PlanFlow`: LLM planner ধাপ ভাগ করে, code সেগুলো চালায় | LLM-চালিত orchestrator যে কাজ ভাগ করে আলাদা agent-দের দেয় |
 | Agent-to-Agent Communication | ⚠️ | Task context দিয়ে sequential handoff | Message-ভিত্তিক বা A2A protocol |
 | Adversarial Debate | ❌ | — | দুই agent বিপরীত পক্ষে, judge সিদ্ধান্ত দেয় (যেমন: example-টা ভালো কিনা) |
 | Critic Agents | ✅ | Reviewer agent (`agents.yaml`), refiner critic (`refiner/reflection.py`) | — |
@@ -164,6 +166,7 @@ tests/               ৩৩৬টা offline test + architecture rule
 | `finetune`, `agent` আর `ops_crew` একে অপরকে import করে না | একই |
 | `model_serving` project-এর কিছু import করে না, কেউ তাকেও import করে না (শুধু HTTP) | একই |
 | Serving আর training-এর `chat_template_kwargs` মেলে | `tests/test_model_serving_integration.py` |
+| Plan-এর ধাপ শুধু user-এর হুবহু শব্দ; কোনো side effect-এর আগে plan gate; প্রতিটা ধাপ পুরো pipeline-এর ভেতর দিয়ে | `tests/test_ops_planning.py`, `tests/test_ops_plan_flow.py` |
 
 ---
 
@@ -172,21 +175,19 @@ tests/               ৩৩৬টা offline test + architecture rule
 1. **আসল LLM দিয়ে যাচাই** *(সবচেয়ে জরুরি)*
    - `./run.sh build && ./run.sh python -m pytest`
    - Ollama-য় `qwen2.5:7b-instruct`, অথবা কোনো API key দিয়ে: `./run.sh python -m ops_crew.evals --report outputs/ops/evals.json`
-   - Pass rate, self-corrected আর reflection-এর সংখ্যা PROCESS.md-তে লিখে রাখা
-2. **Level 1 শেষ করা: Planning**
-   - Planner একটা typed `Plan` বানাবে (ধাপ, নির্ভরতা), code প্রতিটা ধাপ validate আর authorize করবে
-   - Fail হলে re-planning, ধাপের সর্বোচ্চ সংখ্যা, destructive ধাপ থাকলে plan-এর শুরুতে approval
-3. **Level 2: Memory**
+   - Pass rate, self-corrected, reflection আর planning-এর সংখ্যা (planned, multi-step, plans repaired) PROCESS.md-তে লিখে রাখা
+   - `OPS_PLANNING=false` দিয়ে আরেকবার চালিয়ে planning-এর লাভ মাপা
+2. **Level 2: Memory**
    - Episodic: audit log থেকে আগের run খোঁজা
    - Semantic: embedding দিয়ে knowledge search
    - Consolidation: fail হওয়া case থেকে নতুন golden case বা training data বানানো
-4. **Level 3:** sandbox execution, dynamic tool retrieval
-5. **Level 4:** LLM orchestrator, adversarial debate (example যাচাই), meta-agent (eval দেখে prompt উন্নত করা)
-6. **Level 5:** OpenTelemetry tracing, telemetry metric, security hardening
-7. **Fine-tuning-এর লক্ষ্য পূরণ**
+3. **Level 3:** sandbox execution, dynamic tool retrieval
+4. **Level 4:** LLM orchestrator, adversarial debate (example যাচাই), meta-agent (eval দেখে prompt উন্নত করা)
+5. **Level 5:** OpenTelemetry tracing, telemetry metric, security hardening
+6. **Fine-tuning-এর লক্ষ্য পূরণ**
    - Dataset ১০ থেকে ৫০০+ example-এ নেওয়া (`ops_crew` দিয়েই curate করা যায়)
    - Distillation: বড় model-এর সফল crew transcript দিয়ে 0.6B-কে LoRA train, তারপর `OPS_LLM_PROFILE=finetuned` দিয়ে eval তুলনা
-8. **Architecture phase 4–5:** `apps/chat_ui` (OpenAI API client), agent-এর `OpenAIBackend`, `finetune chat`/`serve` সরানো
+7. **Architecture phase 4–5:** `apps/chat_ui` (OpenAI API client), agent-এর `OpenAIBackend`, `finetune chat`/`serve` সরানো
 
 ---
 
@@ -198,6 +199,8 @@ tests/               ৩৩৬টা offline test + architecture rule
 | Dataset মাত্র ১০টা example | Smoke test-এর জন্য যথেষ্ট, আসল training-এর জন্য না |
 | 0.6B model multi-agent JSON flow-এ দুর্বল | Crew আর critic-এ 7B+ model ব্যবহার, অথবা distillation |
 | Refiner-এ Anthropic নেই | PydanticAI আর CrewAI-র dependency conflict (`apps/requirements.txt`-এ বিস্তারিত) |
+| Plan-এর একটা ধাপ শুধু নিজের অংশটুকু দেখে | "এই দুটো যোগ করো: Q1 … Q2 …"-এর মতো shared context-এ একটা ধাপ অস্পষ্ট হতে পারে; তখন crew প্রশ্ন করে বা escalate করে, অনুমানে কিছু করে না। সমাধান: planned intent crew-কে hint হিসেবে দেওয়া |
+| Plan-এর মাঝে fail করলে rollback নেই | আগের ধাপ যা করেছে তা থেকে যায়, ফলাফলে `partially_completed` আর কোন ধাপ কী হলো দেখায়। পরে Saga (compensation) |
 | PydanticAI 1.107.7-এ আটকানো | CrewAI 1.15-এর সাথে চলে এমন সর্বশেষ version। Upgrade-এর আগে দুটো একসাথে import হয় কিনা দেখতে হবে |
 
 ---

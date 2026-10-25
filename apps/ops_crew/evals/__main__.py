@@ -17,6 +17,7 @@ from ops_crew.settings import OpsSettings
 def make_deps_factory(settings: OpsSettings, workdir: Path, verbose: bool):
     from ops_crew.crew.config import load_config
     from ops_crew.crew.llm import ProfileLLMFactory
+    from ops_crew.crew.planner import CrewPlanner
     from ops_crew.crew.proposer import CrewProposer
     from ops_crew.crew.tools import ReadOnlyDataset
     from ops_crew.flow import FlowDeps
@@ -45,6 +46,7 @@ def make_deps_factory(settings: OpsSettings, workdir: Path, verbose: bool):
             audit=AuditLog([JsonlSink(workdir / "audit.jsonl")]),
             settings=settings,
             refiner=refiner,
+            planner=CrewPlanner(config, llms, verbose=verbose) if settings.planning else None,
         )
 
     return make_deps

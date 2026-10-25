@@ -2,8 +2,9 @@
 
 Fine-tuning harness for Qwen3-0.6B (`finetune/`: TRL SFT, full or LoRA, eval, CLI chat, FastAPI),
 a model-agnostic tool-calling agent loop (`agent/`), and a hybrid CrewAI agent (`ops_crew/`:
-deterministic Flow + 3-agent crew) that curates the training data, with self-correction and
-reflection from the generic `refiner/` package (PydanticAI).
+deterministic Flow + 3-agent crew, with a planner that splits multi-action requests into steps)
+that curates the training data, with self-correction and reflection from the generic `refiner/`
+package (PydanticAI).
 README.md has the layout and commands, ARCHITECTURE.md the component design and dependency rules,
 PROCESS.md the decision log, apps/ROADMAP.md the learning-level progress.
 Layout: `finetune/` (core) at the root; `agent/`, `ops_crew/`, `refiner/` under `apps/`, which is on
@@ -64,7 +65,14 @@ requirements, Dockerfile and `run.sh`; its code is in `model_serving/src` (on py
 - The LLM only proposes. Authorization, business rules and execution live in `ops_crew/domain/`;
   never move a rule into a prompt or let a crew tool write data (tools get `ReadOnlyDataset`).
 - Every crew output goes through `domain/validation.py`; new task outputs need a schema in
-  `schemas.py` and an entry in `TASK_SCHEMAS` (config loading enforces the match).
+  `schemas.py` and an entry in `TASK_SCHEMAS` (`PLANNER_TASK_SCHEMAS` for the planner; config
+  loading enforces the match).
+- Planning (`domain/planning.py`, `PlanFlow` in flow.py): a plan step is a verbatim excerpt of the
+  request and runs on the original text, so the planner never adds content. The plan gate (role for
+  every step, `max_plan_steps`, whole-plan approval when a multi-step plan changes data) runs before
+  any side effect, and every step still goes through the full OpsFlow (policy, approval, executor).
+  A one-step plan must stay identical to the unplanned path. Never re-plan with the model after a
+  policy denial, a declined approval or a failed step; only plan structure is correctable.
 - Side-effecting actions go through `ActionExecutor` (idempotency key) and are listed in
   `policy.SIDE_EFFECTS`; destructive ones also in `policy.DESTRUCTIVE` (human approval).
 - CrewAI 1.15: Flow route labels must differ from method names; LLMs come from `crew/llm.py`

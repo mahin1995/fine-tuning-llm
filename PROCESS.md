@@ -372,9 +372,41 @@ tends to reproduce the same invalid output.
   the contract check over real HTTP. Not yet run on the GPU with the real model (no Hub access
   in the build environment).
 
+## Step 16 — Task decomposition & planning in `ops_crew` (Level 1) *(written, tested offline)*
+
+- Before: decomposition was static (`classify → research → review` in `tasks.yaml`) and one request
+  carried one intent, so "remove the N+1 example and add this improved version" lost an action or
+  ended in a clarifying question.
+- Now **plan-and-execute**: a planner agent (`config/planner.yaml`, no tools) returns a typed `Plan`
+  (steps with one intent, a verbatim excerpt of the request, `depends_on` on earlier steps only).
+  The planner only proposes; `domain/planning.py` decides:
+  - structure is checked (excerpts are the user's own words, no overlap, valid dependencies). A broken
+    plan is repaired by the refiner (`repair_plan`) or the planner is asked again. Without a usable plan
+    the request takes the old one-intent path, so planning can't make a request fail that worked before;
+  - the plan gate runs before any side effect: one forbidden step rejects the whole plan, more than
+    `max_plan_steps` (4) actions are rejected, and a multi-step plan that changes data is approved as a
+    whole (the approval shows the plan hash and each step's original text);
+  - every step runs through the unchanged OpsFlow as a subgraph (`PlanFlow` in flow.py), on its original
+    text, so policy, per-action approval, idempotency and audit apply per step. A step whose dependency did
+    not complete is skipped; a step whose crew proposes another intent than planned escalates; injection
+    markers anywhere in the request count for every step.
+- Decisions (asked before implementing): plan structure is the only thing the model may repair; a failed
+  step is never re-planned by the model (that would invite it to route around a rule). Planning is on by
+  default (`OPS_PLANNING`), at the cost of one planner call per request. On failure only dependent steps are
+  skipped; the result is `partially_completed` and there is no rollback (a Saga would be the next step).
+- A one-step plan is exactly the unplanned path (whole request, no expected intent), so the 14 existing
+  golden cases keep their meaning. 6 new golden cases cover planning; `plan_explain_then_add` checks that
+  even a human approving everything can't put model-written text into the dataset.
+- Known limit: a step only sees its own words. Shared context ("add these two: Q1 ... Q2 ...") can leave a
+  step ambiguous; the crew then asks or escalates instead of guessing. Passing the planned intent to the
+  crew as a hint would help; not done yet.
+- Tested offline: 39 domain tests, 16 PlanFlow route tests, a full plan through real CrewAI crews on
+  scripted LLMs, planner config errors, `repair_plan` on FunctionModels, and all 20 golden cases with an
+  oracle planner and crew. Not yet measured with a real LLM.
+
 ## Tests
 
-`python -m pytest` runs 336 tests offline (including `model_serving/tests`). The ops_crew tests skip themselves
+`python -m pytest` runs 403 tests offline (including `model_serving/tests`). The ops_crew tests skip themselves
 when `apps/requirements.txt` isn't installed. They cover:
 - **finetune:** data, training (full and LoRA), template consistency, evaluation, serving
 - **agent:** the loop, the parser, tools and calculator safety, Qwen integration
@@ -382,6 +414,8 @@ when `apps/requirements.txt` isn't installed. They cover:
   agents on scripted LLMs, evals with an oracle crew
 - **refiner:** self-correction in all output modes, the reflection loop, fallback, local function models
 - **ops_crew + refiner:** every new flow route, the real adapter on FunctionModels
+- **ops_crew planning:** plan checks and gate, every PlanFlow route, a full plan through real crews,
+  plan repair, planned golden cases with an oracle planner
 - **model_serving:** registry, download, tool-call parsing, the API with a fake engine, streaming,
   the contract check, the transformers engine and the OpenAI SDK as a client
 - **architecture:** package boundaries

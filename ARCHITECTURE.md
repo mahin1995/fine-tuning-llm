@@ -109,7 +109,7 @@ LoRA target layers), recorded in `run_info.json`. Unchanged: `data/` (schema, va
 | App | Port it depends on | Adapters |
 |---|---|---|
 | `agent` | `ChatBackend` | `QwenBackend` (in-process, today), `OpenAIBackend` (HTTP, new) |
-| `ops_crew` | LLM profiles (`llms.yaml`), `Proposer`, `Refiner` | CrewAI crew, `refiner` via `refinement.py` |
+| `ops_crew` | LLM profiles (`llms.yaml`), `Planner`, `Proposer`, `Refiner` | CrewAI planner + crew, `refiner` via `refinement.py` |
 | `refiner` | PydanticAI `Model` | OpenAI-compatible / Ollama / function model |
 | `chat_ui` | OpenAI HTTP API | any runtime from 3.3 |
 
