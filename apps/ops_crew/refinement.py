@@ -2,7 +2,8 @@
 
 This is the only module that imports `refiner` (enforced by tests/test_architecture.py).
 It supplies the ops-specific parts: prompts (with untrusted text delimited), the
-correctable checks from domain/correction.py, and model construction from llms.yaml.
+correctable checks from domain/correction.py and domain/planning.py, and model
+construction from llms.yaml.
 """
 import json
 import os
@@ -14,8 +15,9 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from ops_crew.crew.config import ConfigError, CrewConfig, LlmProfile
 from ops_crew.domain.correction import correctable_problems
-from ops_crew.domain.ports import RefinementError, ReflectionOutcome, RepairRequest
-from ops_crew.schemas import ActionProposal, ResearchFindings
+from ops_crew.domain.planning import plan_problems
+from ops_crew.domain.ports import PlanRepairRequest, RefinementError, ReflectionOutcome, RepairRequest
+from ops_crew.schemas import ActionProposal, Plan, ResearchFindings
 from refiner import (
     Critique,
     ModelSpec,
@@ -45,6 +47,7 @@ class ReflectionConfig(_Strict):
 
 class RefineInstructions(_Strict):
     repair: str
+    repair_plan: str
     critic_answer: str
     critic_example: str
     reviser: str
@@ -177,6 +180,25 @@ class PydanticAIRefiner:
         try:
             return self_correct(model, ActionProposal, prompt, instructions=self._config.instructions.repair,
                                 checks=[still_correctable], max_retries=self._config.max_retries,
+                                output_mode=mode).output
+        except RefinerError as e:
+            raise RefinementError(str(e)) from e
+
+    def repair_plan(self, req: PlanRepairRequest) -> Plan:
+        model, mode = self._model("repair")
+        prompt = "\n\n".join([
+            "Problems to fix (from the validator):\n" + "\n".join(f"- {p}" for p in req.problems),
+            _data("user_request", req.request),
+            _data("previous_output", req.previous_output[:MAX_PREVIOUS_OUTPUT_CHARS]),
+            "Return the corrected Plan.",
+        ])
+
+        def still_broken(plan: Plan) -> list[str]:
+            return plan_problems(plan, req.request)
+
+        try:
+            return self_correct(model, Plan, prompt, instructions=self._config.instructions.repair_plan,
+                                checks=[still_broken], max_retries=self._config.max_retries,
                                 output_mode=mode).output
         except RefinerError as e:
             raise RefinementError(str(e)) from e

@@ -3,13 +3,17 @@
     python -m ops_crew "How many examples are in the training data?"
     python -m ops_crew --role editor "Add Q: What is a Spring profile? A: A named set of beans ..."
     python -m ops_crew --role admin "Remove the example about bean scopes"     # asks for approval
+    python -m ops_crew --role admin "Remove the N+1 example and add: Q: ... A: ..."  # planned: 2 steps
     OPS_LLM_PROFILE=openai python -m ops_crew --json "What does REQUIRES_NEW do?"
 
 The role comes from the caller (here: the CLI flag; in a service: authentication), never
 from the request text. Approval prompts are shown only on an interactive terminal; in
 non-interactive runs every approval is denied.
 
-Exit code: 0 for completed / clarification_needed, 1 otherwise.
+A planner splits requests that ask for several actions into steps (OPS_PLANNING=false turns it
+off); a plan that changes data is shown for approval as a whole before its first step runs.
+
+Exit code: 0 for completed / clarification_needed, 1 otherwise (including partially_completed).
 """
 import os
 
@@ -32,6 +36,7 @@ OK_OUTCOMES = {"completed", "clarification_needed"}
 def build_deps(settings: OpsSettings, *, interactive: bool, log_to_stderr: bool, verbose: bool):
     from ops_crew.crew.config import load_config
     from ops_crew.crew.llm import ProfileLLMFactory
+    from ops_crew.crew.planner import CrewPlanner
     from ops_crew.crew.proposer import CrewProposer
     from ops_crew.crew.tools import ReadOnlyDataset
     from ops_crew.domain.actions import ActionExecutor
@@ -64,6 +69,7 @@ def build_deps(settings: OpsSettings, *, interactive: bool, log_to_stderr: bool,
         audit=audit,
         settings=settings,
         refiner=refiner,
+        planner=CrewPlanner(config, llms, verbose=verbose) if settings.planning else None,
     )
 
 
@@ -93,8 +99,13 @@ def main(argv=None):
 
     if args.json:
         print(json.dumps(asdict(result), indent=2, ensure_ascii=False, default=str))
+    elif len(result.steps) > 1:
+        print(f"[{result.outcome}] plan {result.plan['hash']}, {len(result.steps)} steps")
+        for step in result.steps:
+            print(f"  {step.step_id} {step.intent} [{step.outcome}] {step.message}")
     else:
         print(f"[{result.outcome}] {result.message}")
+    if not args.json:
         print(f"correlation id: {result.correlation_id} (audit log: {settings.audit_log_path})", file=sys.stderr)
     return 0 if result.outcome in OK_OUTCOMES else 1
 

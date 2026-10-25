@@ -1,6 +1,6 @@
 """Multi-LLM support: every agent gets an LLM built from a named profile.
 
-Selection order per agent: OPS_LLM_PROFILE_<AGENT> > OPS_LLM_PROFILE > agents.yaml `llm`.
+Selection order per agent: OPS_LLM_PROFILE_<AGENT> > OPS_LLM_PROFILE > agents.yaml / planner.yaml `llm`.
 Each profile may list fallbacks, tried in order if the provider call raises.
 Temperature is always 0.
 """
@@ -10,7 +10,7 @@ from crewai import LLM
 from crewai.llms.base_llm import BaseLLM
 from pydantic import Field, PrivateAttr
 
-from ops_crew.crew.config import ConfigError, CrewConfig, LlmProfile
+from ops_crew.crew.config import PLANNER_AGENT, ConfigError, CrewConfig, LlmProfile
 
 
 class LLMFactory(Protocol):
@@ -19,7 +19,7 @@ class LLMFactory(Protocol):
 
 def profile_name_for(agent_name: str, config: CrewConfig, env: dict) -> str:
     name = (env.get(f"OPS_LLM_PROFILE_{agent_name.upper()}") or env.get("OPS_LLM_PROFILE")
-            or config.agents[agent_name].llm)
+            or config.agent_spec(agent_name).llm)
     if name not in config.profiles:
         raise ConfigError(f"agent {agent_name}: LLM profile {name!r} is not defined in llms.yaml")
     return name
@@ -100,7 +100,7 @@ class ProfileLLMFactory:
     def check(self) -> None:
         """Build every agent's LLM once so a missing key or bad profile fails at startup,
         not as a retried crew failure on the first request."""
-        for agent_name in self._config.agents:
+        for agent_name in [*self._config.agents, PLANNER_AGENT]:
             self.for_agent(agent_name)
 
     def __init__(self, config: CrewConfig, env: dict,

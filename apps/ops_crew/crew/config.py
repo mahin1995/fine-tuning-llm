@@ -8,9 +8,11 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from ops_crew import schemas
-from ops_crew.domain.validation import TASK_SCHEMAS
+from ops_crew.domain.validation import PLANNER_TASK_SCHEMAS, TASK_SCHEMAS
 
 _ENV_REF = re.compile(r"\$\{([A-Z0-9_]+)(?::-([^}]*))?\}")
+PLANNER_AGENT = "planner"                        # agent name for LLM profile lookup (OPS_LLM_PROFILE_PLANNER)
+PLANNER_TASK = next(iter(PLANNER_TASK_SCHEMAS))  # "plan_request"
 
 
 class ConfigError(ValueError):
@@ -65,15 +67,44 @@ class TaskSpec(_Strict):
     context: list[str] = Field(default_factory=list)
 
 
+class PlannerTaskSpec(_Strict):
+    output: str
+    description: str
+    expected_output: str
+
+
+class PlannerSpec(_Strict):
+    """planner.yaml: the planner's agent and its single task (no tools, no context)."""
+    agent: AgentSpec
+    task: PlannerTaskSpec
+
+    @model_validator(mode="after")
+    def check(self):
+        if self.agent.tools:
+            raise ValueError("the planner gets no tools (it only splits the request)")
+        expected = PLANNER_TASK_SCHEMAS[PLANNER_TASK]
+        if getattr(schemas, self.task.output, None) is not expected:
+            raise ValueError(f"planner task output must be {expected.__name__}")
+        return self
+
+
 class CrewConfig(_Strict):
     agents: dict[str, AgentSpec]
     tasks: dict[str, TaskSpec]
     profiles: dict[str, LlmProfile]
+    planner: PlannerSpec
+
+    def agent_spec(self, name: str) -> AgentSpec:
+        return self.planner.agent if name == PLANNER_AGENT else self.agents[name]
 
     @model_validator(mode="after")
     def cross_check(self):
         from ops_crew.crew.tools import TOOL_NAMES
 
+        if PLANNER_AGENT in self.agents:
+            raise ValueError(f"agent name {PLANNER_AGENT!r} is reserved for planner.yaml")
+        if self.planner.agent.llm not in self.profiles:
+            raise ValueError(f"planner: unknown llm profile {self.planner.agent.llm!r}")
         if list(self.tasks) != list(TASK_SCHEMAS):
             raise ValueError(f"tasks must be exactly {list(TASK_SCHEMAS)} in order, got {list(self.tasks)}")
         for name, task in self.tasks.items():
@@ -119,6 +150,7 @@ def load_config(config_dir: Path, env: dict | None = None) -> CrewConfig:
             agents=_read_yaml(config_dir / "agents.yaml"),
             tasks=_read_yaml(config_dir / "tasks.yaml"),
             profiles=_expand_profiles(_read_yaml(config_dir / "llms.yaml")["profiles"], env),
+            planner=_read_yaml(config_dir / "planner.yaml"),
         )
     except (OSError, KeyError, yaml.YAMLError, ValueError) as e:
         raise ConfigError(f"invalid crew config in {config_dir}: {e}") from e

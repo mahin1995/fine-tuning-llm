@@ -25,6 +25,22 @@ Every terminal step writes a "finished" audit record. The flow only orders the s
 all decisions are made by functions in ops_crew.domain.
 Route labels deliberately differ from method names (CrewAI 1.15 rejects a label that
 equals a handler name).
+
+With a Planner (FlowDeps.planner), PlanFlow wraps the pipeline above (plan-and-execute):
+
+    intake ─► check_input ─┬─ input_invalid ──► reject_input
+                           └─ input_ok ──► make_plan (planner + checks, repair / retries;
+                                           planner unavailable -> one unplanned step)
+                                             └─ plan_ready ──► gate_plan
+                                                   ├─ plan_denied ─────────► reject_plan
+                                                   ├─ plan_allowed ────────► run_steps
+                                                   └─ plan_needs_approval ─► request_plan_approval
+                                                                               ├─ plan_approved ► run_steps
+                                                                               └─ plan_declined ► decline_plan
+
+run_steps runs every step through OpsFlow above (a subgraph), in plan order, on the user's own
+text for that step; a step whose dependencies did not complete is skipped. A one-step plan is
+exactly the unplanned path. Step correlation ids are <correlation id>.s1, <correlation id>.s2, ...
 """
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -40,12 +56,27 @@ from ops_crew.domain.approval import ApprovalGateway, ApprovalRequest
 from ops_crew.domain.audit import AuditLog
 from ops_crew.domain.inputs import InputRejected, clean_request
 from ops_crew.domain.correction import REFLECTED_INTENTS, correctable_problems, reflection_route
+from ops_crew.domain.planning import (
+    SKIPPED,
+    StepResult,
+    blocked_by,
+    describe_plan,
+    plan_gate,
+    plan_hash,
+    plan_message,
+    plan_outcome,
+    plan_problems,
+    step_input,
+)
 from ops_crew.domain.policy import Outcome, authorize
-from ops_crew.domain.ports import Proposer, ProposerError, Refiner, RepairRequest
+from ops_crew.domain.ports import Planner, PlanRepairRequest, Proposer, ProposerError, Refiner, RepairRequest
 from ops_crew.domain.repository import DatasetRepository
-from ops_crew.domain.validation import validate_parts, validate_run
-from ops_crew.schemas import ActionProposal, Intent, ResearchFindings, Role, ToolCallRecord, ValidatedRun
+from ops_crew.domain.validation import PLANNER_TASK_SCHEMAS, OutputValidationError, parse_output, validate_parts, \
+    validate_run
+from ops_crew.schemas import ActionProposal, Intent, Plan, ResearchFindings, Role, ToolCallRecord, ValidatedRun
 from ops_crew.settings import OpsSettings
+
+PLAN_SCHEMA = PLANNER_TASK_SCHEMAS["plan_request"]
 
 
 @dataclass
@@ -58,6 +89,7 @@ class FlowDeps:
     settings: OpsSettings
     new_correlation_id: Callable[[], str] = field(default=lambda: uuid.uuid4().hex[:12])
     refiner: Refiner | None = None  # None: blind retries, no reflection (original behaviour)
+    planner: Planner | None = None  # None: one request = one intent (no planning)
 
 
 class OpsState(BaseModel):
@@ -68,6 +100,8 @@ class OpsState(BaseModel):
     clean_text: str = ""
     suspicious: bool = False
     input_error: str | None = None
+    expected_intent: Intent | None = None  # plan step: the intent it was planned (and approved) for
+    inherited_suspicious: bool = False     # plan step: injection markers anywhere in the full request
     attempts: int = 0
     errors: list[str] = Field(default_factory=list)
     proposal: ActionProposal | None = None
@@ -81,15 +115,32 @@ class OpsState(BaseModel):
     data: dict = Field(default_factory=dict)
 
 
-def run_with_timeout(fn: Callable[[], Any], timeout: float):
+def run_with_timeout(fn: Callable[[], Any], timeout: float, what: str = "crew"):
     pool = ThreadPoolExecutor(max_workers=1)
     future = pool.submit(fn)
     try:
         return future.result(timeout=timeout)
     except FuturesTimeout:
-        raise ProposerError(f"crew timed out after {timeout:g}s") from None
+        raise ProposerError(f"{what} timed out after {timeout:g}s") from None
     finally:
         pool.shutdown(wait=False, cancel_futures=True)
+
+
+def _intake(flow, inherited_suspicious: bool = False) -> None:
+    """Shared first step of both flows: correlation id, request cleanup, injection markers."""
+    state = flow.state
+    if not state.correlation_id:
+        state.correlation_id = flow._deps.new_correlation_id()
+    try:
+        clean = clean_request(state.request, flow._deps.settings.max_request_chars)
+    except InputRejected as e:
+        state.input_error = str(e)
+        flow._audit("intake", role=state.role.value, accepted=False, error=str(e))
+        return
+    state.clean_text = clean.text
+    state.suspicious = clean.suspicious or inherited_suspicious
+    flow._audit("intake", role=state.role.value, accepted=True, chars=len(clean.text),
+                suspicious=state.suspicious, injection_markers=list(clean.markers))
 
 
 class OpsFlow(Flow[OpsState]):
@@ -113,18 +164,7 @@ class OpsFlow(Flow[OpsState]):
     # -------------------------------------------------------------------- steps
     @start()
     def intake(self):
-        if not self.state.correlation_id:
-            self.state.correlation_id = self._deps.new_correlation_id()
-        try:
-            clean = clean_request(self.state.request, self._deps.settings.max_request_chars)
-        except InputRejected as e:
-            self.state.input_error = str(e)
-            self._audit("intake", role=self.state.role.value, accepted=False, error=str(e))
-            return
-        self.state.clean_text = clean.text
-        self.state.suspicious = clean.suspicious
-        self._audit("intake", role=self.state.role.value, accepted=True, chars=len(clean.text),
-                    suspicious=clean.suspicious, injection_markers=list(clean.markers))
+        _intake(self, self.state.inherited_suspicious)
 
     @router(intake)
     def check_input(self):
@@ -222,6 +262,11 @@ class OpsFlow(Flow[OpsState]):
         if proposal.intent == Intent.UNKNOWN and proposal.clarifying_question:
             self.state.message = proposal.clarifying_question
             return "low_confidence"
+        expected = self.state.expected_intent
+        if expected is not None and proposal.intent != expected:  # never run what the plan gate didn't see
+            self.state.errors.append(f"step was planned as '{expected.value}' but the crew proposed "
+                                     f"'{proposal.intent.value}'")
+            return "needs_escalation"
         return "proposal_ready"
 
     @listen("low_confidence")
@@ -319,11 +364,198 @@ class OpsResult:
     tool_calls: list[ToolCallRecord]
     repairs: int = 0          # successful self-corrections
     reflection: dict | None = None
+    planned: bool = False     # a checked plan was used (False: no planner, or it was unavailable)
+    plan: dict | None = None  # hash, steps, attempts and repairs of that plan
+    steps: list[StepResult] = field(default_factory=list)  # PlanFlow: one result per step, in plan order
 
 
-def run_request(deps: FlowDeps, request: str, role: Role, request_id: str | None = None) -> OpsResult:
+class PlanState(BaseModel):
+    request: str = ""
+    role: Role = Role.VIEWER
+    request_id: str | None = None
+    correlation_id: str = ""
+    clean_text: str = ""
+    suspicious: bool = False
+    input_error: str | None = None
+    plan: Plan | None = None  # None: no usable plan, the request runs as one unplanned step
+    plan_attempts: int = 0
+    plan_repairs: int = 0
+    plan_errors: list[str] = Field(default_factory=list)
+    decision_reasons: list[str] = Field(default_factory=list)
+    outcome: str = ""
+    message: str = ""
+
+
+class PlanFlow(Flow[PlanState]):
+    """Plan-and-execute: the planner proposes steps, code checks and gates the plan, and every
+    step runs through OpsFlow. Decisions are made by ops_crew.domain.planning."""
+    _deps: FlowDeps = PrivateAttr()
+    _runs: list = PrivateAttr(default_factory=list)  # (StepResult, OpsResult | None) per step, in plan order
+
+    def __init__(self, deps: FlowDeps, **kwargs):
+        super().__init__(**kwargs)
+        self._deps = deps
+        self._runs = []
+
+    # ------------------------------------------------------------------ helpers
+    def _audit(self, step: str, **fields):
+        self._deps.audit.record(self.state.correlation_id, step, **fields)
+
+    def _finish(self, outcome: str, message: str):
+        self.state.outcome = outcome
+        self.state.message = message
+        self._audit("finished", outcome=outcome, message=message, steps=len(self._runs))
+        return outcome
+
+    # -------------------------------------------------------------------- steps
+    @start()
+    def intake(self):
+        _intake(self)
+
+    @router(intake)
+    def check_input(self):
+        return "input_invalid" if self.state.input_error else "input_ok"
+
+    @listen("input_invalid")
+    def reject_input(self):
+        return self._finish("rejected", f"invalid request: {self.state.input_error}")
+
+    @router("input_ok")
+    def make_plan(self):
+        plan = self._plan()
+        if plan is None:  # planning only adds abilities: without a plan the request runs unplanned, as before
+            self._audit("planning_failed", errors=self.state.plan_errors, fallback="unplanned")
+        else:
+            self.state.plan = plan
+            self._audit("plan_validated", plan_hash=plan_hash(plan), attempts=self.state.plan_attempts,
+                        repairs=self.state.plan_repairs,
+                        steps=[{"id": st.id, "intent": st.intent.value, "depends_on": st.depends_on}
+                               for st in plan.steps])
+        return "plan_ready"
+
+    def _plan(self) -> Plan | None:
+        settings = self._deps.settings
+        for attempt in range(1, settings.max_retries + 2):
+            self.state.plan_attempts = attempt
+            try:
+                raw = run_with_timeout(
+                    lambda: self._deps.planner.plan(self.state.clean_text, self.state.correlation_id),
+                    settings.crew_timeout_seconds, what="planner")
+            except Exception as e:  # PlannerError, timeout, provider errors: ask the planner again
+                self._planning_attempt_failed(attempt, type(e).__name__, str(e))
+                continue
+            try:
+                plan = parse_output(raw, PLAN_SCHEMA)
+            except OutputValidationError as e:
+                problems, previous = [str(e)], raw
+            else:
+                problems, previous = plan_problems(plan, self.state.clean_text), plan.model_dump_json()
+            if not problems:
+                return plan
+            if self._deps.refiner is None:
+                self._planning_attempt_failed(attempt, "PlanValidationError", "; ".join(problems))
+                continue
+            return self._repair_plan(PlanRepairRequest(self.state.clean_text, previous, problems))
+        return None
+
+    def _planning_attempt_failed(self, attempt, kind, detail):
+        self.state.plan_errors.append(f"planning attempt {attempt}: {kind}: {detail}")
+        self._audit("planning_attempt_failed", attempt=attempt, error_type=kind, error=detail[:500])
+
+    def _repair_plan(self, req: PlanRepairRequest) -> Plan | None:
+        self._audit("plan_self_correction_started", problems=req.problems)
+        try:
+            plan = run_with_timeout(lambda: self._deps.refiner.repair_plan(req),
+                                    self._deps.settings.crew_timeout_seconds, what="plan repair")
+        except Exception as e:  # RefinementError, timeout, provider errors
+            self.state.plan_errors.append(f"plan self-correction failed: {type(e).__name__}: {e}")
+            self._audit("plan_self_correction_failed", error_type=type(e).__name__, error=str(e)[:500])
+            return None
+        problems = plan_problems(plan, req.request)  # a repaired plan is checked like any other
+        if problems:
+            self.state.plan_errors.append("plan self-correction returned an invalid plan: " + "; ".join(problems))
+            self._audit("plan_self_correction_failed", error_type="PlanValidationError", error="; ".join(problems))
+            return None
+        self.state.plan_repairs += 1
+        self._audit("plan_self_correction_succeeded", steps=len(plan.steps))
+        return plan
+
+    @router("plan_ready")
+    def gate_plan(self):
+        plan = self.state.plan
+        if plan is None:
+            return "plan_allowed"  # one unplanned step: the regular pipeline decides everything
+        decision = plan_gate(plan, self.state.role, max_steps=self._deps.settings.max_plan_steps,
+                             suspicious=self.state.suspicious)
+        self.state.decision_reasons = decision.reasons
+        self._audit("plan_authorization", decision=decision.outcome.value, reasons=decision.reasons,
+                    plan_hash=plan_hash(plan))
+        return {Outcome.ALLOW: "plan_allowed", Outcome.DENY: "plan_denied",
+                Outcome.NEEDS_APPROVAL: "plan_needs_approval"}[decision.outcome]
+
+    @listen("plan_denied")
+    def reject_plan(self):
+        return self._finish("rejected", "; ".join(self.state.decision_reasons))
+
+    @router("plan_needs_approval")
+    def request_plan_approval(self):
+        plan = self.state.plan
+        digest = plan_hash(plan)
+        steps = describe_plan(plan, self.state.clean_text).replace("\n", "\n  ")
+        approved = self._deps.approvals.request(ApprovalRequest(
+            correlation_id=self.state.correlation_id,
+            intent="plan",
+            summary=f"{len(plan.steps)} steps [{digest}]\n  {steps}",
+            reasons=tuple(self.state.decision_reasons),
+        ))
+        self._audit("plan_approval", approved=approved, plan_hash=digest)
+        return "plan_approved" if approved else "plan_declined"
+
+    @listen("plan_declined")
+    def decline_plan(self):
+        return self._finish("declined", "a human declined the plan")
+
+    @listen(or_("plan_allowed", "plan_approved"))
+    def run_steps(self):
+        plan = self.state.plan
+        if plan is None:
+            self._run_step("s1", None, self.state.clean_text, None)
+        else:
+            results: dict[str, StepResult] = {}
+            for step in plan.steps:
+                blocked = blocked_by(step, results)
+                if blocked:
+                    results[step.id] = self._skip_step(step.id, step.intent.value, blocked)
+                    continue
+                text, expected = step_input(plan, step, self.state.clean_text)
+                results[step.id] = self._run_step(step.id, step.intent.value, text, expected)
+        step_results = [result for result, _ in self._runs]
+        return self._finish(plan_outcome(step_results), plan_message(step_results))
+
+    def _run_step(self, step_id: str, planned_intent: str | None, text: str, expected: Intent | None) -> StepResult:
+        run = run_single(self._deps, text, self.state.role, self.state.request_id,
+                         correlation_id=f"{self.state.correlation_id}.{step_id}", expected_intent=expected,
+                         inherited_suspicious=self.state.suspicious)
+        result = StepResult(step_id, planned_intent, run.outcome, run.message, run.correlation_id, dict(run.data))
+        self._runs.append((result, run))
+        self._audit("step_finished", plan_step=step_id, outcome=run.outcome, step_correlation_id=run.correlation_id)
+        return result
+
+    def _skip_step(self, step_id: str, planned_intent: str, blocked: list[str]) -> StepResult:
+        result = StepResult(step_id, planned_intent, SKIPPED, f"not run: {', '.join(blocked)} did not complete")
+        self._runs.append((result, None))
+        self._audit("step_skipped", plan_step=step_id, blocked_by=blocked)
+        return result
+
+
+def run_single(deps: FlowDeps, request: str, role: Role, request_id: str | None = None, *,
+               correlation_id: str | None = None, expected_intent: Intent | None = None,
+               inherited_suspicious: bool = False) -> OpsResult:
+    """One request, one intent: the OpsFlow pipeline. PlanFlow runs every step through it."""
     flow = OpsFlow(deps, suppress_flow_events=True)
-    flow.kickoff(inputs={"request": request, "role": role.value, "request_id": request_id})
+    flow.kickoff(inputs={"request": request, "role": role.value, "request_id": request_id,
+                         "correlation_id": correlation_id or "", "expected_intent": expected_intent,
+                         "inherited_suspicious": inherited_suspicious})
     s = flow.state
     return OpsResult(
         correlation_id=s.correlation_id, outcome=s.outcome, message=s.message, data=dict(s.data),
@@ -331,3 +563,38 @@ def run_request(deps: FlowDeps, request: str, role: Role, request_id: str | None
         params=s.proposal.params.model_dump(exclude_none=True) if s.proposal else {},
         tool_calls=list(s.tool_calls), repairs=s.repairs, reflection=dict(s.reflection) or None,
     )
+
+
+def run_plan(deps: FlowDeps, request: str, role: Role, request_id: str | None = None) -> OpsResult:
+    """Plan first (PlanFlow), then run the steps. A one-step result is reported exactly like an
+    unplanned run; several steps report their results in `steps`."""
+    flow = PlanFlow(deps, suppress_flow_events=True)
+    flow.kickoff(inputs={"request": request, "role": role.value, "request_id": request_id})
+    s = flow.state
+    steps = [result for result, _ in flow._runs]
+    runs = [run for _, run in flow._runs if run is not None]
+    only = runs[0] if len(steps) == 1 and runs else None
+    errors = list(s.plan_errors)
+    if only is not None:
+        errors += only.errors
+    else:
+        errors += [f"{result.step_id}: {e}" for result, run in flow._runs if run is not None for e in run.errors]
+    plan = None
+    if s.plan is not None:
+        plan = {"hash": plan_hash(s.plan), "steps": [st.model_dump(mode="json") for st in s.plan.steps],
+                "rationale": s.plan.rationale, "attempts": s.plan_attempts, "repairs": s.plan_repairs}
+    return OpsResult(
+        correlation_id=s.correlation_id, outcome=s.outcome, message=s.message,
+        data=dict(only.data) if only else {}, attempts=sum(r.attempts for r in runs), errors=errors,
+        intent=only.intent if only else None, params=dict(only.params) if only else {},
+        tool_calls=[c for r in runs for c in r.tool_calls], repairs=sum(r.repairs for r in runs),
+        reflection=only.reflection if only else None, planned=s.plan is not None, plan=plan, steps=steps,
+    )
+
+
+def run_request(deps: FlowDeps, request: str, role: Role, request_id: str | None = None) -> OpsResult:
+    """Entry point: planned (PlanFlow) when deps.planner is set, otherwise one request with one
+    intent (OpsFlow)."""
+    if deps.planner is None:
+        return run_single(deps, request, role, request_id)
+    return run_plan(deps, request, role, request_id)

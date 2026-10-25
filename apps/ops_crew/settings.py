@@ -23,6 +23,8 @@ class OpsSettings(BaseSettings):
 
     llm_profile: str | None = None  # override every agent's LLM profile (see config/llms.yaml)
     refine: bool = True  # self-correction + reflection via the refiner package (config/refine.yaml)
+    planning: bool = True  # split multi-action requests into steps first (config/planner.yaml)
+    max_plan_steps: int = Field(default=4, ge=1, le=9)  # more actions in one request are rejected
 
     @property
     def audit_log_path(self) -> Path:

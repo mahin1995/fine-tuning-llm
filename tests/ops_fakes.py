@@ -1,4 +1,4 @@
-"""Shared fakes for ops_crew tests: scripted proposer, crew-run builder, dataset copies."""
+"""Shared fakes for ops_crew tests: scripted planner / proposer / refiner, builders, dataset copies."""
 import json
 import shutil
 
@@ -7,7 +7,7 @@ from ops_crew.domain.audit import AuditLog, MemorySink
 from ops_crew.domain.idempotency import InMemoryIdempotencyStore
 from ops_crew.domain.ports import ProposerError
 from ops_crew.domain.repository import DatasetRepository
-from ops_crew.schemas import CrewRun, ToolCallRecord
+from ops_crew.schemas import CrewRun, Plan, ToolCallRecord
 from ops_crew.settings import OpsSettings
 
 from conftest import EVAL_DATA, TRAIN_DATA
@@ -33,6 +33,28 @@ def make_run(intent="ask", *, params=None, answer=None, confidence=0.9, classifi
     return CrewRun(outputs=outputs, tool_calls=[ToolCallRecord(**c) for c in (tool_calls or [])])
 
 
+def make_plan(*steps, rationale="split by intent") -> dict:
+    """A plan as the planner would return it: steps are (intent, excerpt, *depends_on)."""
+    return {"steps": [{"id": f"s{i}", "intent": intent, "excerpt": excerpt, "depends_on": list(deps)}
+                      for i, (intent, excerpt, *deps) in enumerate(steps, start=1)],
+            "rationale": rationale}
+
+
+class FakePlanner:
+    """Returns (or raises) scripted plans in order: dicts (JSON-encoded), raw strings or exceptions."""
+
+    def __init__(self, *results):
+        self.results = list(results)
+        self.calls = []
+
+    def plan(self, request, correlation_id):
+        self.calls.append((request, correlation_id))
+        result = self.results.pop(0)
+        if isinstance(result, BaseException):
+            raise result
+        return result if isinstance(result, str) else json.dumps(result)
+
+
 class FakeProposer:
     """Returns (or raises) scripted results in order; records every call."""
 
@@ -53,11 +75,13 @@ class FakeProposer:
 class FakeRefiner:
     """Scripted Refiner: `repairs` (proposals or exceptions) and `reviews` (ReflectionOutcome or exceptions)."""
 
-    def __init__(self, repairs=(), reviews=()):
+    def __init__(self, repairs=(), reviews=(), plans=()):
         self.repairs = list(repairs)
         self.reviews = list(reviews)
+        self.plans = list(plans)
         self.repair_calls = []
         self.review_calls = []
+        self.plan_repair_calls = []
 
     def _next(self, queue):
         item = queue.pop(0)
@@ -77,6 +101,11 @@ class FakeRefiner:
         self.review_calls.append(("add_example", proposal))
         return self._next(self.reviews)
 
+    def repair_plan(self, req):
+        self.plan_repair_calls.append(req)
+        item = self._next(self.plans)
+        return Plan.model_validate(item) if isinstance(item, dict) else item
+
 
 class RecordingApprovals:
     def __init__(self, answer: bool):
@@ -95,7 +124,7 @@ def copy_datasets(tmp_path):
     return DatasetRepository(train, evals)
 
 
-def build_deps(tmp_path, proposer, approvals=None, refiner=None, **settings_overrides):
+def build_deps(tmp_path, proposer, approvals=None, refiner=None, planner=None, **settings_overrides):
     from ops_crew.flow import FlowDeps  # needs crewai
 
     repo = copy_datasets(tmp_path)
@@ -111,8 +140,10 @@ def build_deps(tmp_path, proposer, approvals=None, refiner=None, **settings_over
                              **settings_overrides),
         new_correlation_id=lambda: next(ids),
         refiner=refiner,
+        planner=planner,
     )
     return deps, sink
 
 
-__all__ = ["make_run", "FakeProposer", "FakeRefiner", "RecordingApprovals", "copy_datasets", "build_deps", "ProposerError"]
+__all__ = ["make_run", "make_plan", "FakePlanner", "FakeProposer", "FakeRefiner", "RecordingApprovals",
+           "copy_datasets", "build_deps", "ProposerError"]

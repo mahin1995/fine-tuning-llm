@@ -4,20 +4,24 @@ The planner (an LLM) only proposes a Plan. This module decides, in code:
 
     plan_problems   structural mistakes the planner can fix itself (fed back for self-correction)
     plan_gate       role / size / approval decision for the whole plan, before any step runs
-    step_input      what each step's pipeline gets (a single step is exactly the unplanned path)
+    step_input      what each step's pipeline gets: the user's own text for the step
+                    (a single step is exactly the unplanned path)
     blocked_by      unfinished dependencies that stop a step
     plan_outcome    one outcome for the whole request from the step outcomes
 
 Every step is a verbatim excerpt of the user's request, so a plan can split and order the
-user's words but never add content. Each step then runs through the normal pipeline (crew,
-validation, policy, approval, executor), so a plan never bypasses a rule. `depends_on` may only
-name earlier steps: plan order is a topological order and a cycle is impossible.
+user's words but never add content. Excerpts are matched ignoring case and whitespace, and a
+step always runs on the original span of the request (original_span), never on the planner's
+copy. Each step then runs through the normal pipeline (crew, validation, policy, approval,
+executor), so a plan never bypasses a rule. `depends_on` may only name earlier steps: plan
+order is a topological order and a cycle is impossible.
 
 Problem texts are written here; the only values inside them are step ids, which the schema
 restricts to s1..s99. They are safe to send back to the model.
 """
 import hashlib
 import json
+import re
 from dataclasses import dataclass, field
 
 from ops_crew.domain.correction import normalize
@@ -111,12 +115,23 @@ def plan_hash(plan: Plan) -> str:
     return "plan-" + hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
-def describe_plan(plan: Plan) -> str:
-    """One line per step, for the approval prompt and the audit log."""
+def original_span(excerpt: str, request: str) -> str | None:
+    """The part of the request an excerpt was copied from, with the user's own case and spacing."""
+    words = excerpt.split()
+    if not words:
+        return None
+    match = re.search(r"\s+".join(map(re.escape, words)), request, flags=re.IGNORECASE)
+    return match.group(0) if match else None
+
+
+def describe_plan(plan: Plan, request: str | None = None) -> str:
+    """One line per step, for the approval prompt. With the request, each step shows the text it
+    will actually run on (its original span)."""
     lines = []
     for step in plan.steps:
         after = f" (after {', '.join(step.depends_on)})" if step.depends_on else ""
-        excerpt = " ".join(step.excerpt.split())
+        text = (original_span(step.excerpt, request) if request else None) or step.excerpt
+        excerpt = " ".join(text.split())
         if len(excerpt) > MAX_SUMMARY_EXCERPT_CHARS:
             excerpt = excerpt[: MAX_SUMMARY_EXCERPT_CHARS - 3] + "..."
         lines.append(f"{step.id} {step.intent.value}{after}: {excerpt!r}")
@@ -125,10 +140,11 @@ def describe_plan(plan: Plan) -> str:
 
 def step_input(plan: Plan, step: PlanStep, request: str) -> tuple[str, Intent | None]:
     """(text for the step's crew, intent the crew must confirm). A single step gets the whole
-    request and no expected intent: exactly the unplanned path."""
+    request and no expected intent: exactly the unplanned path. Other steps get the original
+    span of their excerpt, so a planner that changed case or spacing changes nothing."""
     if len(plan.steps) == 1:
         return request, None
-    return step.excerpt, step.intent
+    return original_span(step.excerpt, request) or step.excerpt, step.intent
 
 
 def blocked_by(step: PlanStep, results: dict[str, StepResult]) -> list[str]:

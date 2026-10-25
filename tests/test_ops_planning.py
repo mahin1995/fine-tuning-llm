@@ -10,6 +10,7 @@ from ops_crew.domain.planning import (  # noqa: E402
     StepResult,
     blocked_by,
     describe_plan,
+    original_span,
     plan_gate,
     plan_hash,
     plan_message,
@@ -169,6 +170,17 @@ def test_step_input():
     single = plan(step("s1", Intent.ASK, "what is DI"))
     assert step_input(single, single.steps[0], REQUEST) == (REQUEST, None)
     assert step_input(REPLACE, REPLACE.steps[1], REQUEST) == (ADD, Intent.ADD_EXAMPLE)
+
+
+def test_steps_run_on_the_users_own_text():
+    """A planner that lower-cases or re-spaces an excerpt passes the check, but the step still
+    gets the user's exact words (an added example keeps its original case)."""
+    sloppy = plan(step("s1", Intent.REMOVE_EXAMPLE, REMOVE.lower()), step("s2", Intent.ADD_EXAMPLE, ADD.lower()))
+    assert plan_problems(sloppy, REQUEST) == []
+    assert step_input(sloppy, sloppy.steps[1], REQUEST) == (ADD, Intent.ADD_EXAMPLE)
+    assert original_span("remove   THE example", "Please Remove the\nexample now") == "Remove the\nexample"
+    assert original_span("not there", REQUEST) is None and original_span("   ", REQUEST) is None
+    assert describe_plan(sloppy, REQUEST).splitlines()[0] == f"s1 remove_example: {REMOVE!r}"
 
 
 @pytest.mark.parametrize("outcome, blocked", [(COMPLETED, []), ("rejected", ["s1"]), (SKIPPED, ["s1"])])
