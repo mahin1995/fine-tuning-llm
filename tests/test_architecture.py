@@ -161,7 +161,7 @@ def test_only_the_ops_crew_adapter_imports_refiner():
 # ------------------------------------------------------------- model_serving
 
 SERVING = ROOT / "model_serving" / "src" / "model_serving"
-PROJECT_PACKAGES = ("finetune", "agent", "ops_crew", "refiner")
+PROJECT_PACKAGES = ("finetune", "agent", "ops_crew", "refiner", "memory")
 
 
 def test_model_serving_is_self_contained():
@@ -187,3 +187,25 @@ def test_nothing_imports_model_serving():
 ])
 def test_light_serving_modules_do_not_import_ml_libraries(module):
     assert not heavy(imported_modules(module)), f"{module} pulls in torch/transformers"
+
+
+# -------------------------------------------------------------------- memory
+
+def test_memory_depends_only_on_the_standard_library():
+    """Generic toolkit: no project package, no third-party library (so no torch either)."""
+    stdlib = set(sys.stdlib_module_names)
+    for path in package_dir("memory").rglob("*.py"):
+        for name in _imports_of(path):
+            top = name.split(".")[0]
+            assert top in stdlib or top == "memory", f"{path.relative_to(ROOT)} imports {name}"
+
+
+def test_memory_is_used_only_where_allowed():
+    """finetune and refiner never use it; in ops_crew only the adapter does (the domain sees ports).
+    apps/agent may use it directly."""
+    for package in ("finetune", "refiner", "ops_crew"):
+        for path in package_dir(package).rglob("*.py"):
+            rel = path.relative_to(ROOT).as_posix()
+            if rel == "apps/ops_crew/memory_adapters.py":
+                continue
+            assert not any(n.split(".")[0] == "memory" for n in _imports_of(path)), f"{rel} imports memory"
