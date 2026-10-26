@@ -1,0 +1,19 @@
+# Memory for the Dataset Ops Assistant (Level 2): semantic search and near-duplicate checks.
+# Turn it all off with OPS_MEMORY=false. Values support ${ENV} and ${ENV:-default}, like llms.yaml.
+
+embeddings:
+  # hashing: offline and deterministic, matches rewordings that keep the key words
+  # openai_compatible: any /v1/embeddings server (Ollama `ollama pull nomic-embed-text`, vLLM, OpenAI)
+  provider: ${OPS_EMBED_PROVIDER:-hashing}
+  model: ${OPS_EMBED_MODEL:-nomic-embed-text}
+  base_url: ${OPS_EMBED_BASE_URL:-http://localhost:11434/v1}
+  api_key_env: OPS_EMBED_API_KEY   # optional; local servers need no key
+  timeout: 30
+
+# Cosine similarity from which a new example counts as close to an existing training question
+# (near_duplicate) or to an eval question (near_eval): a human then approves the add. Exact
+# duplicates and eval questions are still rejected by policy. Thresholds depend on the embedder:
+# hashing is calibrated on this repo's data in tests/test_memory.py; re-tune for a real model.
+similarity:
+  hashing: {near_duplicate: 0.6, near_eval: 0.6}
+  openai_compatible: {near_duplicate: 0.9, near_eval: 0.9}

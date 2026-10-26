@@ -2,6 +2,7 @@
 from dataclasses import dataclass, field
 from typing import Protocol
 
+from ops_crew.domain.working_memory import VerifiedFacts
 from ops_crew.schemas import ActionProposal, ClassifiedRequest, CrewRun, Plan, ResearchFindings
 
 
@@ -12,6 +13,43 @@ class ProposerError(RuntimeError):
 class Proposer(Protocol):
     def propose(self, request: str, correlation_id: str) -> CrewRun:
         """Run the crew on one request. Must not have side effects. Raises ProposerError."""
+        ...
+
+
+@dataclass(frozen=True)
+class SimilarExample:
+    example_id: str
+    score: float  # cosine similarity of the embedder that produced it
+
+
+@dataclass(frozen=True)
+class SimilarityReport:
+    """How close a question is to the training and eval data, with the thresholds calibrated for
+    the embedder that produced the scores (they differ per embedder). policy.py decides."""
+    closest_example: SimilarExample | None
+    eval_score: float
+    near_duplicate_threshold: float
+    near_eval_threshold: float
+    embedder: str
+    error: str | None = None  # the check could not run: policy asks a human instead
+
+    @classmethod
+    def unavailable(cls, error: str) -> "SimilarityReport":
+        return cls(None, 0.0, 1.0, 1.0, "none", error)
+
+
+class SimilarityIndex(Protocol):
+    """Meaning-based lookups over the datasets (ops_crew/memory_adapters.py). Eval questions are
+    only ever scored, never returned."""
+
+    def search(self, query: str, k: int) -> list[str]:
+        """Example ids for a search query, best first (keywords and meaning)."""
+        ...
+
+    def similar_examples(self, text: str, k: int = 3) -> list[SimilarExample]:
+        ...
+
+    def report(self, text: str) -> SimilarityReport:
         ...
 
 
@@ -37,6 +75,7 @@ class RepairRequest:
     findings: ResearchFindings
     previous_output: str              # the crew's raw or re-serialised proposal (untrusted)
     problems: list[str]               # written by our code: safe to show to the model
+    facts: VerifiedFacts = VerifiedFacts()  # what the tools returned (working_memory.py)
 
 
 @dataclass(frozen=True)

@@ -69,10 +69,20 @@ from ops_crew.domain.planning import (
     step_input,
 )
 from ops_crew.domain.policy import Outcome, authorize
-from ops_crew.domain.ports import Planner, PlanRepairRequest, Proposer, ProposerError, Refiner, RepairRequest
+from ops_crew.domain.ports import (
+    Planner,
+    PlanRepairRequest,
+    Proposer,
+    ProposerError,
+    Refiner,
+    RepairRequest,
+    SimilarityIndex,
+    SimilarityReport,
+)
 from ops_crew.domain.repository import DatasetRepository
 from ops_crew.domain.validation import PLANNER_TASK_SCHEMAS, OutputValidationError, parse_output, validate_parts, \
     validate_run
+from ops_crew.domain.working_memory import VerifiedFacts
 from ops_crew.schemas import ActionProposal, Intent, Plan, ResearchFindings, Role, ToolCallRecord, ValidatedRun
 from ops_crew.settings import OpsSettings
 
@@ -90,6 +100,7 @@ class FlowDeps:
     new_correlation_id: Callable[[], str] = field(default=lambda: uuid.uuid4().hex[:12])
     refiner: Refiner | None = None  # None: blind retries, no reflection (original behaviour)
     planner: Planner | None = None  # None: one request = one intent (no planning)
+    similarity: SimilarityIndex | None = None  # None: no near-duplicate checks (OPS_MEMORY=false)
 
 
 class OpsState(BaseModel):
@@ -198,16 +209,16 @@ class OpsFlow(Flow[OpsState]):
             if not parts.context_ok:  # without a valid classification + research there is nothing to repair
                 self._attempt_failed(attempt, "OutputValidationError", "; ".join(parts.errors.values()))
                 continue
+            facts = VerifiedFacts.from_tool_calls(run.tool_calls)
             if parts.proposal is None:
                 problems, previous = [parts.errors["review_proposal"]], run.outputs.get("review_proposal", "")
             else:
-                problems = correctable_problems(parts.proposal, parts.classification, parts.findings,
-                                                self.state.clean_text)
+                problems = correctable_problems(parts.proposal, parts.classification, self.state.clean_text, facts)
                 previous = parts.proposal.model_dump_json()
             proposal = parts.proposal
             if problems:
                 proposal = self._repair(RepairRequest(self.state.clean_text, parts.classification, parts.findings,
-                                                      previous, problems))
+                                                      previous, problems, facts))
                 if proposal is None:
                     return "needs_escalation"
             return self._accept(ValidatedRun(classification=parts.classification, findings=parts.findings,
@@ -308,12 +319,27 @@ class OpsFlow(Flow[OpsState]):
             self.state.proposal = proposal.model_copy(update={"issues": proposal.issues + notes})
         return "reviewed"
 
+    def _similarity(self, proposal: ActionProposal) -> SimilarityReport | None:
+        """How close a new example is to the training and eval data (semantic memory)."""
+        if self._deps.similarity is None or proposal.intent != Intent.ADD_EXAMPLE or not proposal.params.question:
+            return None
+        try:
+            report = self._deps.similarity.report(proposal.params.question)
+        except Exception as e:  # never skip the check silently: policy asks a human instead
+            report = SimilarityReport.unavailable(f"{type(e).__name__}: {e}"[:300])
+        closest = report.closest_example
+        self._audit("similarity", embedder=report.embedder, error=report.error,
+                    closest_example=closest.example_id if closest else None,
+                    score=round(closest.score, 3) if closest else None, eval_score=round(report.eval_score, 3))
+        return report
+
     @router("reviewed")
     def authorize_proposal(self):
         proposal = self.state.proposal
         decision = authorize(proposal, self.state.role, self._deps.repo,
                              suspicious_input=self.state.suspicious,
-                             already_executed=self._deps.executor.already_executed(proposal, self.state.request_id))
+                             already_executed=self._deps.executor.already_executed(proposal, self.state.request_id),
+                             similarity=self._similarity(proposal))
         self.state.decision_reasons = decision.reasons
         self._audit("authorization", decision=decision.outcome.value, reasons=decision.reasons)
         return {Outcome.ALLOW: "authorized", Outcome.DENY: "denied",

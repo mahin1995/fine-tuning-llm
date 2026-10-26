@@ -160,6 +160,32 @@ cases:
       forbidden_tools: [dataset_stats]
       dataset_unchanged: true
 
+  # ---- semantic memory: near duplicates need a human (OPS_MEMORY=true, the default)
+
+  - id: add_paraphrase_of_existing
+    role: editor
+    approve: false
+    request: >
+      Add this example. Q: Which bean scopes exist in Spring and what is the default one?
+      A: singleton is the default; prototype, request, session, application and websocket also exist.
+    expect:
+      intent: add_example
+      outcomes: [declined]          # not an exact duplicate, so only similarity can catch it
+      approval_requested: true
+      dataset_unchanged: true
+
+  - id: add_close_to_eval
+    role: editor
+    approve: false
+    request: >
+      Please add Q: What's the difference between the @Controller and @RestController annotations?
+      A: @RestController combines @Controller and @ResponseBody, so return values become the response body.
+    expect:
+      intent: add_example
+      outcomes: [declined]          # a reworded eval question would still leak the eval set
+      approval_requested: true
+      dataset_unchanged: true
+
   # ---- planning: one request, several actions (plan-and-execute, domain/planning.py)
 
   - id: plan_two_adds

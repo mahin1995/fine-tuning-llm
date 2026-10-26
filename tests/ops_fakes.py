@@ -30,7 +30,15 @@ def make_run(intent="ask", *, params=None, answer=None, confidence=0.9, classifi
         }),
     }
     outputs.update(overrides)
-    return CrewRun(outputs=outputs, tool_calls=[ToolCallRecord(**c) for c in (tool_calls or [])])
+    calls = [ToolCallRecord(**c) for c in (tool_calls or [])]
+    if related_ids:  # the ids the research tools returned (the shared working state the checks trust)
+        facts = {"example_ids": list(related_ids)}
+        search = next((i for i, c in enumerate(calls) if c.tool == "search_training_data" and not c.facts), None)
+        if search is None:
+            calls.append(ToolCallRecord(agent="researcher", tool="search_training_data", arguments={}, facts=facts))
+        else:
+            calls[search] = calls[search].model_copy(update={"facts": facts})
+    return CrewRun(outputs=outputs, tool_calls=calls)
 
 
 def make_plan(*steps, rationale="split by intent") -> dict:
@@ -124,7 +132,8 @@ def copy_datasets(tmp_path):
     return DatasetRepository(train, evals)
 
 
-def build_deps(tmp_path, proposer, approvals=None, refiner=None, planner=None, **settings_overrides):
+def build_deps(tmp_path, proposer, approvals=None, refiner=None, planner=None, memory=False, **settings_overrides):
+    """`memory=True` wires the real DatasetSimilarity (hashing embedder: offline, deterministic)."""
     from ops_crew.flow import FlowDeps  # needs crewai
 
     repo = copy_datasets(tmp_path)
@@ -142,6 +151,11 @@ def build_deps(tmp_path, proposer, approvals=None, refiner=None, planner=None, *
         refiner=refiner,
         planner=planner,
     )
+    if memory:
+        from ops_crew.memory_adapters import DatasetSimilarity, load_memory_config
+
+        deps.similarity = DatasetSimilarity.from_config(repo, load_memory_config(deps.settings.config_dir, env={}),
+                                                        env={})
     return deps, sink
 
 

@@ -25,6 +25,11 @@ def make_deps_factory(settings: OpsSettings, workdir: Path, verbose: bool):
     config = load_config(settings.config_dir)
     llms = ProfileLLMFactory(config, dict(os.environ))
     llms.check()  # fail fast on missing keys instead of 13 escalated cases
+    memory_config = None
+    if settings.memory:
+        from ops_crew.memory_adapters import DatasetSimilarity, load_memory_config
+
+        memory_config = load_memory_config(settings.config_dir)
     refiner = None
     if settings.refine:
         from ops_crew.refinement import PydanticAIRefiner
@@ -38,8 +43,9 @@ def make_deps_factory(settings: OpsSettings, workdir: Path, verbose: bool):
         shutil.copy(settings.train_data, train)
         shutil.copy(settings.eval_data, evals)
         repo = DatasetRepository(train, evals)
+        similarity = DatasetSimilarity.from_config(repo, memory_config) if memory_config else None
         return FlowDeps(
-            proposer=CrewProposer(config, llms, ReadOnlyDataset(repo), verbose=verbose),
+            proposer=CrewProposer(config, llms, ReadOnlyDataset(repo, similarity), verbose=verbose),
             repo=repo,
             executor=ActionExecutor(repo, InMemoryIdempotencyStore()),
             approvals=approval,
@@ -47,6 +53,7 @@ def make_deps_factory(settings: OpsSettings, workdir: Path, verbose: bool):
             settings=settings,
             refiner=refiner,
             planner=CrewPlanner(config, llms, verbose=verbose) if settings.planning else None,
+            similarity=similarity,
         )
 
     return make_deps

@@ -175,7 +175,7 @@ class PydanticAIRefiner:
         ])
 
         def still_correctable(p: ActionProposal) -> list[str]:
-            return correctable_problems(p, req.classification, req.findings, req.request)
+            return correctable_problems(p, req.classification, req.request, req.facts)
 
         try:
             return self_correct(model, ActionProposal, prompt, instructions=self._config.instructions.repair,

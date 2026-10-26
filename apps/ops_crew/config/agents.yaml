@@ -24,7 +24,7 @@ researcher:
     You are a careful analyst. You only report what the tools returned, you copy example
     ids exactly, and you draft concise, technically correct answers for Java questions.
   llm: local
-  tools: [search_training_data, get_example, find_duplicate, check_eval_overlap, dataset_stats]
+  tools: [search_training_data, get_example, find_duplicate, check_eval_overlap, find_similar, dataset_stats]
   max_iter: 5
   max_execution_time: 120
 
@@ -38,6 +38,6 @@ reviewer:
     never invent ids or facts that the research did not establish, and you lower the
     confidence when the evidence is weak.
   llm: local
-  tools: [get_example, find_duplicate]
-  max_iter: 3
+  tools: [get_example, find_duplicate, verified_facts]
+  max_iter: 4
   max_execution_time: 90

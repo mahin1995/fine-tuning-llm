@@ -56,13 +56,18 @@ def build_deps(settings: OpsSettings, *, interactive: bool, log_to_stderr: bool,
         "-", "llm_fallback", model=model, error=f"{type(err).__name__}: {err}"[:300]))
     llms.check()
     repo = DatasetRepository(settings.train_data, settings.eval_data)
+    similarity = None
+    if settings.memory:
+        from ops_crew.memory_adapters import DatasetSimilarity, load_memory_config
+
+        similarity = DatasetSimilarity.from_config(repo, load_memory_config(settings.config_dir, env), env)
     refiner = None
     if settings.refine:
         from ops_crew.refinement import PydanticAIRefiner
 
         refiner = PydanticAIRefiner.from_config(settings.config_dir, config, env)
     return FlowDeps(
-        proposer=CrewProposer(config, llms, ReadOnlyDataset(repo), verbose=verbose),
+        proposer=CrewProposer(config, llms, ReadOnlyDataset(repo, similarity), verbose=verbose),
         repo=repo,
         executor=ActionExecutor(repo, JsonlIdempotencyStore(settings.idempotency_path)),
         approvals=ConsoleApproval() if interactive else DenyAllApprovals(),
@@ -70,6 +75,7 @@ def build_deps(settings: OpsSettings, *, interactive: bool, log_to_stderr: bool,
         settings=settings,
         refiner=refiner,
         planner=CrewPlanner(config, llms, verbose=verbose) if settings.planning else None,
+        similarity=similarity,
     )
 
 

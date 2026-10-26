@@ -3,6 +3,7 @@ decide what is allowed."""
 from dataclasses import dataclass, field
 from enum import StrEnum
 
+from ops_crew.domain.ports import SimilarityReport
 from ops_crew.domain.repository import DatasetRepository
 from ops_crew.schemas import ActionProposal, Intent, Role
 
@@ -64,11 +65,27 @@ def _param_problems(proposal: ActionProposal, repo: DatasetRepository) -> list[s
     return []
 
 
+def similarity_reasons(report: SimilarityReport) -> list[str]:
+    """Near duplicates and near eval questions are fuzzy signals: they ask a human, never reject.
+    (Exact duplicates and eval questions are rejected by _param_problems before this runs.)"""
+    if report.error:
+        return [f"similarity check unavailable ({report.error}); check for near duplicates by hand"]
+    reasons = []
+    closest = report.closest_example
+    if closest is not None and closest.score >= report.near_duplicate_threshold:
+        reasons.append(f"similar to existing example {closest.example_id} (score {closest.score:.2f})")
+    if report.eval_score >= report.near_eval_threshold:
+        reasons.append(f"close to an eval question (score {report.eval_score:.2f}): possible leakage")
+    return reasons
+
+
 def authorize(proposal: ActionProposal, role: Role, repo: DatasetRepository, *,
-              suspicious_input: bool = False, already_executed: bool = False) -> Decision:
+              suspicious_input: bool = False, already_executed: bool = False,
+              similarity: SimilarityReport | None = None) -> Decision:
     """`already_executed`: the idempotency store holds a result for this exact action. The role
     is still checked, but data rules (e.g. "duplicate example") are skipped: the action already
-    happened, and the executor will replay its stored result instead of running it again."""
+    happened, and the executor will replay its stored result instead of running it again.
+    `similarity`: for add_example, how close the question is to existing and eval questions."""
     required = REQUIRED_ROLE.get(proposal.intent)
     if required is None:
         return Decision(Outcome.DENY, [f"intent {proposal.intent.value!r} is not supported"])
@@ -88,6 +105,8 @@ def authorize(proposal: ActionProposal, role: Role, repo: DatasetRepository, *,
         reasons.append("request contains prompt-injection markers")
     if proposal.intent in SIDE_EFFECTS and proposal.issues:
         reasons.append("reviewer raised issues: " + "; ".join(proposal.issues))
+    if proposal.intent == Intent.ADD_EXAMPLE and similarity is not None:
+        reasons += similarity_reasons(similarity)
     if reasons:
         return Decision(Outcome.NEEDS_APPROVAL, reasons)
     return Decision(Outcome.ALLOW, ["all checks passed"])

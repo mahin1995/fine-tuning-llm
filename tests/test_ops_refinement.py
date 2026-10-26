@@ -15,6 +15,7 @@ from ops_crew.domain.correction import correctable_problems, reflection_route  #
 from ops_crew.domain.ports import PlanRepairRequest, RefinementError, ReflectionOutcome, RepairRequest  # noqa: E402
 from ops_crew.domain.repository import example_id_for  # noqa: E402
 from ops_crew.domain.validation import validate_parts  # noqa: E402
+from ops_crew.domain.working_memory import VerifiedFacts  # noqa: E402
 from ops_crew.flow import run_request  # noqa: E402
 from ops_crew.refinement import PydanticAIRefiner, load_refine_config  # noqa: E402
 from ops_crew.schemas import ActionProposal, ClassifiedRequest, Intent, ResearchFindings, Role  # noqa: E402
@@ -38,6 +39,7 @@ def classification(intent="ask"):
 
 
 FINDINGS = ResearchFindings(summary="s", related_example_ids=["aaaaaaaaaaaa"], duplicate_of="bbbbbbbbbbbb")
+FACTS = VerifiedFacts(example_ids=frozenset({"aaaaaaaaaaaa", "bbbbbbbbbbbb"}))  # what the tools returned
 
 
 def outcome(p, score=0.9, accepted=True, issues=(), stop="accepted", rounds=0):
@@ -48,29 +50,40 @@ def outcome(p, score=0.9, accepted=True, issues=(), stop="accepted", rounds=0):
 # ------------------------------------------------------ correctable problems
 
 def test_correct_proposal_has_no_problems():
-    assert correctable_problems(proposal(answer="x"), classification(), FINDINGS, "q") == []
+    assert correctable_problems(proposal(answer="x"), classification(), "q", FACTS) == []
     add = proposal("add_example", params={"question": NEW_Q, "answer": NEW_A})
-    assert correctable_problems(add, classification("add_example"), FINDINGS, ADD_REQUEST) == []
+    assert correctable_problems(add, classification("add_example"), ADD_REQUEST, FACTS) == []
+    found = proposal("remove_example", params={"example_id": "aaaaaaaaaaaa"})
+    assert correctable_problems(found, classification("remove_example"), "remove it", FACTS) == []
 
 
 def test_correctable_problem_messages_are_exact():
-    assert correctable_problems(proposal(answer="  "), classification(), FINDINGS, "q") == [
+    assert correctable_problems(proposal(answer="  "), classification(), "q", FACTS) == [
         "intent is 'ask' but `answer` is empty; write the answer using the research"]
-    assert correctable_problems(proposal("dataset_stats"), classification("ask"), FINDINGS, "q") == [
+    assert correctable_problems(proposal("dataset_stats"), classification("ask"), "q", FACTS) == [
         "intent 'dataset_stats' differs from the classification 'ask'; use the same intent or explain the "
         "change in `issues`"]
     rewritten = proposal("add_example", params={"question": NEW_Q, "answer": "A nicer answer I wrote myself."})
-    assert correctable_problems(rewritten, classification("add_example"), FINDINGS, ADD_REQUEST) == [
+    assert correctable_problems(rewritten, classification("add_example"), ADD_REQUEST, FACTS) == [
         "params.answer must be copied verbatim from the request, not rewritten"]
     invented = proposal("remove_example", params={"example_id": "cccccccccccc"})
-    assert correctable_problems(invented, classification("remove_example"), FINDINGS, "remove it") == [
-        "params.example_id cccccccccccc was not found by the research (found: aaaaaaaaaaaa, bbbbbbbbbbbb); "
-        "use one of those, or leave it empty and set clarifying_question"]
+    assert correctable_problems(invented, classification("remove_example"), "remove it", FACTS) == [
+        "params.example_id cccccccccccc was not returned by any dataset tool (returned: aaaaaaaaaaaa, "
+        "bbbbbbbbbbbb); use one of those, or leave it empty and set clarifying_question"]
+
+
+def test_an_id_the_researcher_only_claims_is_not_a_fact():
+    """Shared working state: the findings say "aaaaaaaaaaaa", but no tool returned it."""
+    claimed = proposal("remove_example", params={"example_id": "aaaaaaaaaaaa"})
+    assert FINDINGS.related_example_ids == ["aaaaaaaaaaaa"]
+    assert correctable_problems(claimed, classification("remove_example"), "remove it", VerifiedFacts()) == [
+        "params.example_id aaaaaaaaaaaa was not returned by any dataset tool (returned: none); use one of those, "
+        "or leave it empty and set clarifying_question"]
 
 
 def test_explained_intent_change_is_accepted():
     p = proposal("dataset_stats", issues=["request asks for counts, not an explanation"])
-    assert correctable_problems(p, classification("ask"), FINDINGS, "q") == []
+    assert correctable_problems(p, classification("ask"), "q", FACTS) == []
 
 
 def test_reflection_route():

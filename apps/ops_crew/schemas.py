@@ -86,6 +86,7 @@ class ToolCallRecord(_Strict):
     agent: str
     tool: str
     arguments: dict
+    facts: dict = Field(default_factory=dict)  # what the tool returned, extracted by code (working memory)
 
 
 class CrewRun(BaseModel):

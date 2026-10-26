@@ -58,6 +58,11 @@ class DatasetRepository:
         key = normalise_question(question)
         return next((e for e in self.examples() if normalise_question(e.question) == key), None)
 
+    def eval_questions(self) -> list[str]:
+        if not self.eval_path.exists():
+            return []
+        return [question_of(m) for m in load_conversations(self.eval_path)]
+
     def overlaps_eval_set(self, question: str) -> bool:
         if not self.eval_path.exists():
             return False

@@ -87,7 +87,8 @@ def _broken_config(tmp_path, file, mutate):
 
 
 @pytest.mark.parametrize("file, mutate, error", [
-    ("agents.yaml", lambda s: s.replace("tools: [get_example, find_duplicate]", "tools: [delete_dataset]"),
+    ("agents.yaml", lambda s: s.replace("tools: [get_example, find_duplicate, verified_facts]",
+                                        "tools: [delete_dataset]"),
      "unknown tool\\(s\\) \\['delete_dataset'\\]"),
     ("agents.yaml", lambda s: s.replace("llm: local", "llm: gpt9", 1), "unknown llm profile 'gpt9'"),
     ("agents.yaml", lambda s: s.replace("max_iter: 5", "max_iter: 50"), "max_iter"),

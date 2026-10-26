@@ -1,7 +1,7 @@
 """Which problems an LLM may be asked to fix (correctable), and the rules for reflection results.
 
 Correctable problems are the model's own mistakes: malformed output, a missing answer,
-a parameter that wasn't copied verbatim, an id the research never found. Feeding them
+a parameter that wasn't copied verbatim, an id no dataset tool returned. Feeding them
 back gives the model a fair chance to fix them.
 
 Everything else is final and decided by policy.py without asking the model again: role
@@ -12,7 +12,8 @@ All problem texts are written by this module (no user or tool text inside), so t
 safe to send back to the model.
 """
 from ops_crew.domain.ports import ReflectionOutcome
-from ops_crew.schemas import ActionProposal, ClassifiedRequest, Intent, ResearchFindings
+from ops_crew.domain.working_memory import VerifiedFacts
+from ops_crew.schemas import ActionProposal, ClassifiedRequest, Intent
 
 REFLECTED_INTENTS = {Intent.ASK, Intent.ADD_EXAMPLE}
 
@@ -22,8 +23,10 @@ def normalize(text: str) -> str:
     return " ".join(text.split()).lower()
 
 
-def correctable_problems(proposal: ActionProposal, classification: ClassifiedRequest,
-                         findings: ResearchFindings, request: str) -> list[str]:
+def correctable_problems(proposal: ActionProposal, classification: ClassifiedRequest, request: str,
+                         facts: VerifiedFacts) -> list[str]:
+    """`facts`: what the tools returned in this request. An id counts as found only if a tool
+    returned it; what the researcher wrote in its findings is a claim, not a fact."""
     problems = []
     if proposal.intent != classification.intent and not proposal.issues:
         problems.append(f"intent '{proposal.intent.value}' differs from the classification "
@@ -37,11 +40,10 @@ def correctable_problems(proposal: ActionProposal, classification: ClassifiedReq
             if value and normalize(value) not in source:
                 problems.append(f"params.{name} must be copied verbatim from the request, not rewritten")
     if proposal.intent == Intent.REMOVE_EXAMPLE and proposal.params.example_id:
-        known = set(findings.related_example_ids) | ({findings.duplicate_of} if findings.duplicate_of else set())
-        if proposal.params.example_id not in known:
-            options = ", ".join(sorted(known)) or "none"
-            problems.append(f"params.example_id {proposal.params.example_id} was not found by the research "
-                            f"(found: {options}); use one of those, or leave it empty and set clarifying_question")
+        if proposal.params.example_id not in facts.example_ids:
+            options = ", ".join(sorted(facts.example_ids)) or "none"
+            problems.append(f"params.example_id {proposal.params.example_id} was not returned by any dataset tool "
+                            f"(returned: {options}); use one of those, or leave it empty and set clarifying_question")
     return problems
 
 
