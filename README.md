@@ -37,6 +37,7 @@ apps/                       APPS: everything that uses a model (on PYTHONPATH, s
   ROADMAP.md                learning levels: what is done, where, what is next
   agent/                    tool-calling agent loop          -> python -m agent
     loop.py, tools.py, parser.py, builtin_tools.py, backend.py (ChatBackend port)
+    user_memory.py          opt-in long-term memory: remember(fact) stores only the user's own words
     backends/qwen.py        adapter to finetune's ChatModel: the only bridge between the two
   ops_crew/                 hybrid CrewAI agent: Dataset Ops Assistant  -> python -m ops_crew "<request>"
     schemas.py, settings.py, config/ (agents, tasks, planner, llms, refine .yaml)
@@ -44,9 +45,13 @@ apps/                       APPS: everything that uses a model (on PYTHONPATH, s
     flow.py                 CrewAI Flows: OpsFlow (intake -> crew -> validate -> authorize -> approve -> execute)
                             and PlanFlow (plan -> gate -> run each step through OpsFlow)
     crew/                   3-agent sequential crew, planner agent, read-only tools, LLM factory with fallbacks
-    evals/                  14 golden cases + runner         -> python -m ops_crew.evals
+    evals/                  22 golden cases + runner         -> python -m ops_crew.evals
     refinement.py           adapter to `refiner` (the only module that imports it)
+    memory_adapters.py      adapter to `memory`: similarity index, episode store (the only module importing it)
+    consolidate.py          episodes -> report, candidate eval cases, training candidates
   refiner/                  generic self-correction + reflection on PydanticAI (domain-agnostic)
+  memory/                   generic memory toolkit, standard library only: BM25 + embeddings (hybrid
+                            retrieval), context budgets (history compaction), SQLite episode store
 
 tests/                      CPU tests (tiny local Qwen3 model, scripted LLMs for CrewAI), incl. architecture rules
 ```
@@ -70,6 +75,8 @@ tests/                      CPU tests (tiny local Qwen3 model, scripted LLMs for
 | `agent/backends/qwen.py`, `agent/__main__.py` | `finetune` (the only bridge) |
 | `refiner` | only `pydantic` / `pydantic_ai` (no project package) |
 | `ops_crew/refinement.py` | `refiner` (the only module that may) |
+| `memory` | only the standard library (no project package, no third-party library) |
+| `agent`, `ops_crew/memory_adapters.py` | `memory` (in ops_crew, the only module that may) |
 | `model_serving` | nothing from the project (self-contained; nothing imports it either) |
 
 `finetune` never imports `agent`. `ops_crew.domain` imports no CrewAI and only reuses
@@ -96,6 +103,9 @@ PORT=8000 ./run.sh python -m finetune serve --model outputs/qwen3-ft   # http://
 
 ./run.sh python -m agent --model outputs/qwen3-ft "What is 17 * 23?"  # one question
 ./run.sh python -m agent --model Qwen/Qwen3-0.6B                      # interactive
+./run.sh python -m agent --memory outputs/agent/memory.db              # remembers what you tell it
+
+./run.sh python -m ops_crew.consolidate                              # past requests -> lessons to review
 
 # OpenAI-compatible model server: its own image, see model_serving/README.md
 model_serving/run.sh build
@@ -121,6 +131,15 @@ question -> model (with tool schemas) -> <tool_call>? --no--> final answer
 Safety rails: `--max-steps` limit, JSON-schema argument validation, tool exceptions
 and malformed calls returned to the model as errors, identical repeated calls not
 re-executed, tool output truncated. Built-in tools have no side effects.
+
+Context and memory (Level 2, see the Memory section):
+- `--context-budget` (default 4000 tokens, counted with the model's tokenizer): before each question the
+  history is compacted: old tool outputs are cleared first, then the oldest turns are dropped; a tool call
+  is never separated from its result.
+- `search_knowledge_base` is hybrid: BM25 plus embeddings (offline hashing by default,
+  `--embed-url http://localhost:11434/v1 --embed-model nomic-embed-text` for a real model).
+- `--memory PATH` (opt-in): the `remember` tool stores facts the user stated, recalled in later
+  conversations as delimited data.
 
 Adding a tool:
 
@@ -259,6 +278,40 @@ crew proposal ─► validate each task output ─► correctable problem? ─ye
   `native` per profile in `llms.yaml` if your server supports it.
 - PydanticAI is pinned to 1.107.7 for compatibility with CrewAI 1.15, and Anthropic profiles
   aren't available to the refiner; see `apps/requirements.txt` for the reasons.
+
+## Memory (Level 2: `memory` + agent + ops_crew)
+
+The rule from Level 1 applies to memory too: **the LLM proposes, code remembers.**
+
+| Kind | Where | What it does |
+|---|---|---|
+| Context engineering | `memory/context.py`, `agent/loop.py` | Token budget for the chat history; deterministic compaction (no LLM summaries, which can drop the delimiters around untrusted text) |
+| Semantic memory | `memory/retrieval.py`, `agent/builtin_tools.py`, `ops_crew/memory_adapters.py` | BM25 + embeddings with Reciprocal Rank Fusion. Agent: knowledge-base search. ops_crew: search, the `find_similar` tool, near-duplicate checks |
+| User memory | `agent/user_memory.py` | `remember(fact)`: only text the user wrote in this conversation, verbatim; recalled facts enter the prompt as `<memory>` data |
+| Shared working state | `ops_crew/domain/working_memory.py`, `crew/tools.py` | Tools record what they actually returned; the reviewer reads it (`verified_facts`), and correction trusts only tool-returned ids, not an agent's claims |
+| Episodic memory | `memory/episodes.py`, `ops_crew/memory_adapters.py` | SQLite (`outputs/ops/memory.db`): every finished request, and every human decline |
+| Consolidation | `ops_crew/consolidate.py` | Episodes become a report, candidate eval cases and training candidates, all for a human to review; `--prune` applies retention |
+
+ops_crew uses memory like this:
+- **Near duplicates:** a new example that means nearly the same as a training question, or an eval
+  question, needs human approval with the score as the reason ("similar to existing example ... (score 0.67)").
+  Exact duplicates and eval questions are still rejected. Thresholds per embedder are in `config/memory.yaml`;
+  the hashing one is calibrated on this repo's data in tests.
+- **Declines are remembered:** a human decline is stored by the action's idempotency key, so the same
+  action needs a human again later, even if it would otherwise pass.
+- **Replies:** `python -m ops_crew --reply-to <id> "the one about bean scopes"` answers a clarifying
+  question. Code joins the earlier request, the question and the answer; the joined text goes through intake
+  again. Unknown, expired (60 min) or non-question ids are rejected before the crew runs.
+
+```bash
+OPS_EMBED_PROVIDER=openai_compatible OPS_EMBED_BASE_URL=http://localhost:11434/v1 \
+  ./run.sh python -m ops_crew --role editor "Add Q: ... A: ..."    # real embeddings (ollama pull nomic-embed-text)
+./run.sh python -m ops_crew.consolidate --days 30 --prune         # outputs/ops/consolidation/
+OPS_MEMORY=false ./run.sh python -m ops_crew.evals                 # compare: no semantic or episodic memory
+```
+
+`memory` is generic and standard-library only (enforced by tests); the embedding provider falls back to
+offline hashing if it fails, so a memory outage never blocks a request.
 
 ## Model profiles and training engines
 

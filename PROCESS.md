@@ -404,9 +404,42 @@ tends to reproduce the same invalid output.
   scripted LLMs, planner config errors, `repair_plan` on FunctionModels, and all 20 golden cases with an
   oracle planner and crew. Not yet measured with a real LLM.
 
+## Step 17 — Context engineering and memory (Level 2) *(written, tested offline)*
+
+- New generic package `apps/memory` (standard library only, like `refiner` is pydantic-only): BM25,
+  an `Embedder` port (offline `HashingEmbedder`, `HttpEmbedder` for any OpenAI-compatible
+  `/embeddings`), hybrid retrieval with Reciprocal Rank Fusion, token budgets with deterministic
+  history compaction, a SQLite episode store, similarity clustering. No new dependency.
+- **Agent:** `--context-budget` fixes the unbounded interactive history (old tool outputs cleared first,
+  then the oldest turns; a tool call never loses its result); exact token counts from the Qwen
+  tokenizer; the knowledge base is hybrid; opt-in `--memory` with a `remember` tool that only accepts
+  the user's own words from the conversation (memory poisoning: tool output can't become a memory).
+- **ops_crew semantic memory:** hybrid `search_training_data`, a `find_similar` tool (eval questions
+  are only scored), and a policy rule: a near duplicate or near eval question needs a human, exact
+  ones stay rejected. Hashing similarity was calibrated on the repo's questions: rewordings 0.65–0.92,
+  unrelated ≤ 0.41, threshold 0.6. Hashing on content words only: with stopwords, "what is the
+  difference between ..." made unrelated questions score like paraphrases.
+- **Shared working state:** tools record what they returned; correction trusts only tool-returned ids
+  (an id the researcher merely claims goes back for correction); the reviewer reads the facts with
+  `verified_facts`.
+- **Episodic memory:** every finished request and every human decline in `outputs/ops/memory.db`. A
+  declined action needs a human again next time; `--reply-to <id>` continues a request that asked a
+  clarifying question (joined text re-checked at intake; 60-minute TTL).
+- **Consolidation:** `python -m ops_crew.consolidate` turns episodes into a report, candidate golden
+  cases (valid case shape, to review) and training candidates (answers that passed reflection), and
+  `--prune` applies retention. Nothing is applied automatically.
+- Decisions (asked before implementing): pluggable embeddings without new dependencies, SQLite for
+  episodes, approval (not rejection) for near duplicates, opt-in user memory with the verbatim rule.
+  CrewAI's built-in memory was not used: the LLM decides what to store there, and our crews are fresh
+  per request on purpose.
+- Deviation from the plan: consolidation is `python -m ops_crew.consolidate`, not `ops_crew.memory`
+  (an `ops_crew.memory` package next to the top-level `memory` package would be confusing).
+- 2 new golden cases (`add_paraphrase_of_existing`, `add_close_to_eval`); with `OPS_MEMORY=false` the
+  paraphrase slips through. Not yet measured with a real LLM or a real embedding model.
+
 ## Tests
 
-`python -m pytest` runs 403 tests offline (including `model_serving/tests`). The ops_crew tests skip themselves
+`python -m pytest` runs 478 tests offline (including `model_serving/tests`). The ops_crew tests skip themselves
 when `apps/requirements.txt` isn't installed. They cover:
 - **finetune:** data, training (full and LoRA), template consistency, evaluation, serving
 - **agent:** the loop, the parser, tools and calculator safety, Qwen integration
@@ -418,6 +451,9 @@ when `apps/requirements.txt` isn't installed. They cover:
   plan repair, planned golden cases with an oracle planner
 - **model_serving:** registry, download, tool-call parsing, the API with a fake engine, streaming,
   the contract check, the transformers engine and the OpenAI SDK as a client
+- **memory:** BM25, embedders (fake HTTP), hybrid fusion and fallback, compaction, episodes, the hashing
+  calibration; agent compaction, user memory and poisoning; ops_crew similarity, shared facts, episodes,
+  replies, decline memory, consolidation
 - **architecture:** package boundaries
 
 ## Open items / decisions made along the way

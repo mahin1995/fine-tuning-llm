@@ -4,9 +4,9 @@
 level-এর কোন অংশ কোথায় implement করা, আর কী বাকি। খুঁটিনাটি design decision-এর জন্য
 [PROCESS.md](../PROCESS.md), আর command ও folder layout-এর জন্য [README.md](../README.md) দেখো।
 
-> **শেষ আপডেট:** Level 1-এর সব অংশ implement হয়েছে (শেষ ধাপ: Task Decomposition & Planning)। Level 3–5-এর কিছু অংশ আগেই হয়ে গেছে।
+> **শেষ আপডেট:** Level 1 আর Level 2-এর সব অংশ implement হয়েছে (Level 2: context budget, hybrid retrieval, shared working state, episodic memory, consolidation)। Level 3–5-এর কিছু অংশ আগেই হয়ে গেছে।
 > Architecture phase 1–3 শেষ (`finetune` core, `apps/`, model profile, `TrainingEngine` port, `model_serving`)।
-> **সতর্কতা:** সব code offline-এ test করা হয়েছে (৪০৩টা test), কিন্তু **আসল LLM বা GPU দিয়ে এখনও চালানো হয়নি।**
+> **সতর্কতা:** সব code offline-এ test করা হয়েছে (৪৭৮টা test), কিন্তু **আসল LLM বা GPU দিয়ে এখনও চালানো হয়নি।**
 
 ---
 
@@ -32,8 +32,9 @@ model_serving/       model download + OpenAI-compatible API  python -m model_ser
 apps/agent/          tool-calling agent loop               python -m agent
 apps/ops_crew/       hybrid CrewAI agent (Dataset Ops)     python -m ops_crew "<request>"
 apps/refiner/        self-correction + reflection          (ops_crew/refinement.py থেকে ব্যবহার হয়)
+apps/memory/         memory toolkit (stdlib only)          (agent আর ops_crew/memory_adapters.py থেকে)
 data/                train.jsonl (10), eval.jsonl (8)
-tests/               ৪০৩টা offline test + architecture rule
+tests/               ৪৭৮টা offline test + architecture rule
 ```
 
 ### `finetune/`: Fine-tuning harness
@@ -92,6 +93,16 @@ tests/               ৪০৩টা offline test + architecture rule
 | Local model (Ollama, vLLM, in-process), output mode tool / native / prompted, fallback | `refiner/models.py` |
 | `ops_crew`-এর সাথে সংযোগ (একমাত্র bridge) | `ops_crew/refinement.py`, `config/refine.yaml` |
 
+### `memory/`: Memory toolkit (Level 2, stdlib only, domain-agnostic)
+| Feature | কোথায় |
+|---|---|
+| BM25 + embedding (offline hashing বা যেকোনো OpenAI-compatible `/embeddings`), Reciprocal Rank Fusion, provider fail করলে hashing-এ ফেরা | `memory/retrieval.py` |
+| Token budget আর deterministic history compaction (tool call আর তার ফল কখনো আলাদা হয় না) | `memory/context.py` |
+| SQLite episode store (request, decline, fact) আর retention | `memory/episodes.py` |
+| একই রকম text group করা (consolidation-এর জন্য) | `memory/consolidation.py` |
+| Agent: context budget, hybrid knowledge base, opt-in user memory (`remember` শুধু user-এর হুবহু কথা) | `agent/loop.py`, `agent/builtin_tools.py`, `agent/user_memory.py` |
+| ops_crew: near-duplicate approval, `find_similar`, `verified_facts`, `--reply-to`, decline memory, consolidation | `ops_crew/memory_adapters.py`, `domain/working_memory.py`, `domain/followup.py`, `consolidate.py` |
+
 ---
 
 ## ৩. Learning Levels: কী হয়েছে, কোথায়, কী বাকি
@@ -111,13 +122,13 @@ tests/               ৪০৩টা offline test + architecture rule
 ### LEVEL 2: Context Engineering & AI Agent Memory
 | বিষয় | অবস্থা | কোথায় | বাকি |
 |---|---|---|---|
-| Context Engineering | ⚠️ | Untrusted text-এর জন্য delimiter (`<user_request>`, `<tool_data>`), tool output কেটে ছোট করা, chat history trim (`finetune/cli/chat.py`) | Context budget (token গোনা), relevance অনুযায়ী বাছাই, summarization |
-| Episodic Memory | ❌ | — | আগের run (audit log) থেকে "কী ঘটেছিল" মনে রাখা |
-| Semantic Memory | ⚠️ | `KnowledgeBase` keyword search (`agent/builtin_tools.py`) | Embedding দিয়ে vector search, তথ্য সংরক্ষণ |
-| Shared Working State | ⚠️ | CrewAI Flow state (`OpsState`), task context | Agent-দের মধ্যে typed shared scratchpad |
-| Memory Consolidation | ❌ | — | Episode থেকে স্থায়ী শিক্ষা বের করা (যেমন: বারবার fail হওয়া request-এর ধরন) |
+| Context Engineering | ✅ | Untrusted text-এর delimiter; agent-এ token budget আর deterministic compaction (`memory/context.py`, `agent/loop.py`, `--context-budget`); Qwen tokenizer দিয়ে exact token গোনা; recall হওয়া memory budget মেনে | আসল LLM-এ budget-এর প্রভাব মাপা |
+| Episodic Memory | ✅ | প্রতিটা request আর human decline SQLite-এ (`ops_crew/memory_adapters.py`); `--reply-to` দিয়ে clarification-এর পরে কাজ চালিয়ে যাওয়া; decline হওয়া action আবার human-এর কাছে যায় | Service হলে user অনুযায়ী আলাদা করা |
+| Semantic Memory | ✅ | BM25 + embedding hybrid retrieval (`memory/retrieval.py`); agent knowledge base; ops_crew search, `find_similar`, প্রায়-duplicate বা প্রায়-eval হলে approval; agent-এর opt-in user memory | আসল embedding model দিয়ে threshold calibrate করা |
+| Shared Working State | ✅ | Tool যা ফেরত দিয়েছে তা code রাখে (`ToolCallRecord.facts`, `domain/working_memory.py`); reviewer পড়ে `verified_facts` দিয়ে; correction শুধু tool-এর ফেরত দেওয়া id মানে | — |
+| Memory Consolidation | ✅ | `python -m ops_crew.consolidate`: report, golden candidate, training candidate (human যাচাই করে), `--prune` দিয়ে retention | নিয়মিত চালানো (cron) আর ফলাফল PROCESS.md-তে লিখে রাখা |
 
-**Level 2 অগ্রগতি: ~১৫%**
+**Level 2 অগ্রগতি: ~১০০%** (সব অংশ implement আর offline-এ test করা; আসল LLM আর embedding model-এ মাপা বাকি)
 
 ### LEVEL 3: Tools, Execution & Human Control
 | বিষয় | অবস্থা | কোথায় | বাকি |
@@ -167,6 +178,8 @@ tests/               ৪০৩টা offline test + architecture rule
 | `model_serving` project-এর কিছু import করে না, কেউ তাকেও import করে না (শুধু HTTP) | একই |
 | Serving আর training-এর `chat_template_kwargs` মেলে | `tests/test_model_serving_integration.py` |
 | Plan-এর ধাপ শুধু user-এর হুবহু শব্দ; কোনো side effect-এর আগে plan gate; প্রতিটা ধাপ পুরো pipeline-এর ভেতর দিয়ে | `tests/test_ops_planning.py`, `tests/test_ops_plan_flow.py` |
+| `memory` শুধু standard library import করে; ops_crew-এ শুধু `memory_adapters.py` তাকে import করে | `tests/test_architecture.py` |
+| Memory poisoning: tool output বা model-এর লেখা memory-তে যায় না; প্রায়-duplicate হলে human | `tests/test_agent_memory.py`, `tests/test_ops_memory*.py` |
 
 ---
 
@@ -176,18 +189,16 @@ tests/               ৪০৩টা offline test + architecture rule
    - `./run.sh build && ./run.sh python -m pytest`
    - Ollama-য় `qwen2.5:7b-instruct`, অথবা কোনো API key দিয়ে: `./run.sh python -m ops_crew.evals --report outputs/ops/evals.json`
    - Pass rate, self-corrected, reflection আর planning-এর সংখ্যা (planned, multi-step, plans repaired) PROCESS.md-তে লিখে রাখা
-   - `OPS_PLANNING=false` দিয়ে আরেকবার চালিয়ে planning-এর লাভ মাপা
-2. **Level 2: Memory**
-   - Episodic: audit log থেকে আগের run খোঁজা
-   - Semantic: embedding দিয়ে knowledge search
-   - Consolidation: fail হওয়া case থেকে নতুন golden case বা training data বানানো
-3. **Level 3:** sandbox execution, dynamic tool retrieval
-4. **Level 4:** LLM orchestrator, adversarial debate (example যাচাই), meta-agent (eval দেখে prompt উন্নত করা)
-5. **Level 5:** OpenTelemetry tracing, telemetry metric, security hardening
-6. **Fine-tuning-এর লক্ষ্য পূরণ**
+   - `OPS_PLANNING=false` আর `OPS_MEMORY=false` দিয়ে আলাদা করে চালিয়ে planning আর memory-র লাভ মাপা
+   - আসল embedding model (`ollama pull nomic-embed-text`) দিয়ে similarity threshold আবার calibrate করা
+2. **Level 3:** sandbox execution, dynamic tool retrieval
+3. **Level 4:** LLM orchestrator, adversarial debate (example যাচাই), meta-agent (eval দেখে prompt উন্নত করা)
+4. **Level 5:** OpenTelemetry tracing, telemetry metric, security hardening
+5. **Fine-tuning-এর লক্ষ্য পূরণ**
    - Dataset ১০ থেকে ৫০০+ example-এ নেওয়া (`ops_crew` দিয়েই curate করা যায়)
    - Distillation: বড় model-এর সফল crew transcript দিয়ে 0.6B-কে LoRA train, তারপর `OPS_LLM_PROFILE=finetuned` দিয়ে eval তুলনা
-7. **Architecture phase 4–5:** `apps/chat_ui` (OpenAI API client), agent-এর `OpenAIBackend`, `finetune chat`/`serve` সরানো
+   - `python -m ops_crew.consolidate`-এর training candidate থেকে human যাচাই করে নতুন example
+6. **Architecture phase 4–5:** `apps/chat_ui` (OpenAI API client), agent-এর `OpenAIBackend`, `finetune chat`/`serve` সরানো
 
 ---
 
@@ -201,6 +212,8 @@ tests/               ৪০৩টা offline test + architecture rule
 | Refiner-এ Anthropic নেই | PydanticAI আর CrewAI-র dependency conflict (`apps/requirements.txt`-এ বিস্তারিত) |
 | Plan-এর একটা ধাপ শুধু নিজের অংশটুকু দেখে | "এই দুটো যোগ করো: Q1 … Q2 …"-এর মতো shared context-এ একটা ধাপ অস্পষ্ট হতে পারে; তখন crew প্রশ্ন করে বা escalate করে, অনুমানে কিছু করে না। সমাধান: planned intent crew-কে hint হিসেবে দেওয়া |
 | Plan-এর মাঝে fail করলে rollback নেই | আগের ধাপ যা করেছে তা থেকে যায়, ফলাফলে `partially_completed` আর কোন ধাপ কী হলো দেখায়। পরে Saga (compensation) |
+| Default hashing embedder শুধু শব্দের মিল বোঝে, সমার্থক শব্দ নয় | আসল embedding model (Ollama, vLLM, OpenAI) config দিলে অর্থের মিল ধরা পড়ে; তখন threshold আবার calibrate করতে হবে |
+| Memory user অনুযায়ী আলাদা নয় | CLI-তে শুধু role আছে, user identity নেই। Service হলে episode আর user memory user অনুযায়ী আলাদা করতে হবে |
 | PydanticAI 1.107.7-এ আটকানো | CrewAI 1.15-এর সাথে চলে এমন সর্বশেষ version। Upgrade-এর আগে দুটো একসাথে import হয় কিনা দেখতে হবে |
 
 ---

@@ -4,10 +4,11 @@ Fine-tuning harness for Qwen3-0.6B (`finetune/`: TRL SFT, full or LoRA, eval, CL
 a model-agnostic tool-calling agent loop (`agent/`), and a hybrid CrewAI agent (`ops_crew/`:
 deterministic Flow + 3-agent crew, with a planner that splits multi-action requests into steps)
 that curates the training data, with self-correction and reflection from the generic `refiner/`
-package (PydanticAI).
+package (PydanticAI) and memory (context budgets, hybrid retrieval, episodes) from the generic
+`memory/` package.
 README.md has the layout and commands, ARCHITECTURE.md the component design and dependency rules,
 PROCESS.md the decision log, apps/ROADMAP.md the learning-level progress.
-Layout: `finetune/` (core) at the root; `agent/`, `ops_crew/`, `refiner/` under `apps/`, which is on
+Layout: `finetune/` (core) at the root; `agent/`, `ops_crew/`, `refiner/`, `memory/` under `apps/`, which is on
 PYTHONPATH (`pytest.ini`, `run.sh`), so imports stay `import ops_crew`. Outside Docker: `export PYTHONPATH=.:apps`.
 `model_serving/` (download + OpenAI-compatible server) is a self-contained component with its own
 requirements, Dockerfile and `run.sh`; its code is in `model_serving/src` (on pytest's pythonpath).
@@ -33,6 +34,9 @@ requirements, Dockerfile and `run.sh`; its code is in `model_serving/src` (on py
   `engines/transformers_engine.py` may import torch/transformers at module level.
 - `refiner/` imports only pydantic / pydantic_ai (it is domain-agnostic). Only
   `ops_crew/refinement.py` imports `refiner`; the flow talks to it through `domain.ports.Refiner`.
+- `memory/` imports only the standard library (domain-agnostic). `agent` may import it; in
+  `ops_crew` only `memory_adapters.py` does (the domain sees `SimilarityIndex` / `EpisodeMemory` ports);
+  `finetune` and `refiner` never do.
 
 ## Rules that keep the pipeline correct
 - Training, inference and the agent must render prompts identically: always pass the model
@@ -78,6 +82,22 @@ requirements, Dockerfile and `run.sh`; its code is in `model_serving/src` (on py
 - CrewAI 1.15: Flow route labels must differ from method names; LLMs come from `crew/llm.py`
   profiles (temperature forced to 0); keys only via env vars named in `llms.yaml`.
 - Tests drive real CrewAI objects with scripted `BaseLLM`s (see tests/test_ops_crew.py); keep them offline.
+
+## memory rules
+- Code writes memory; the LLM never decides what becomes a fact. The one exception, the agent's
+  `remember` tool, accepts only text the user wrote in this conversation (verbatim), never tool
+  output or model text (memory poisoning). It is opt-in and the only agent tool with a side effect.
+- Recalled memory enters prompts as delimited data (`memory.delimit`), never as instructions.
+- Shared working state: trust what tools returned (`ToolCallRecord.facts`, `VerifiedFacts`), not
+  what an agent claims in its output.
+- Similarity is a fuzzy signal: near duplicates / near eval questions ask a human (policy.py);
+  exact duplicates and eval questions stay rejected. Thresholds are per embedder in
+  `config/memory.yaml`; re-calibrate them (tests/test_memory.py) when the embedder changes.
+- Keep compaction deterministic (`memory.compact_messages`); never split a tool call from its result.
+- Memory failures never fail a request: the embedder falls back to hashing, a failing similarity
+  check asks a human, episode writes are audited (`memory_write_failed`).
+- Consolidation only proposes (report, candidate eval cases, training candidates); a human reviews
+  and adds them. Retention (`episodes.retention_days`) keeps episodic memory bounded.
 
 ## refiner rules
 - Only problems the model can legitimately fix go back to it (`domain/correction.py`); rule

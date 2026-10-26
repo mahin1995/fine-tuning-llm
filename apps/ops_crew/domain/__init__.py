@@ -6,6 +6,8 @@
     validation   crew / planner output -> Pydantic models (fence/JSON extraction, exact errors)
     correction   which proposal problems the model may fix itself, reflection rules
     planning     plan checks, the plan gate (role, size, approval), step dependencies, outcome
+    working_memory  VerifiedFacts: what the tools returned in this request (shared working state)
+    followup     replies to clarifying questions (episodic memory)
     policy       authorization + business rules -> Decision
     idempotency  idempotency keys and stores
     approval     ApprovalGateway for destructive / risky actions

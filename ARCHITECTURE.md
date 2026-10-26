@@ -46,7 +46,7 @@ fine-tuning-llm/
 |---|---|---|---|
 | **`finetune`** (core) | dataset rules, training, evaluation (loss needs logits, so in-process) | serving, chat, agents | torch, transformers, trl, peft (`requirements.txt`) |
 | **`model_serving`** | model download, inference server with OpenAI API | training, generation policy (`max_tokens`, temperature come from callers) | torch, transformers, fastapi, huggingface_hub (`model_serving/requirements.txt`) |
-| **`apps`** | everything that *uses* a model: agent loop, ops crew, refiner, chat UI | how the model is hosted | crewai, pydantic-ai, openai client (`apps/requirements.txt`) |
+| **`apps`** | everything that *uses* a model: agent loop, ops crew, refiner, memory, chat UI | how the model is hosted | crewai, pydantic-ai, openai client (`apps/requirements.txt`); `memory` is stdlib only |
 
 ---
 
@@ -108,9 +108,10 @@ LoRA target layers), recorded in `run_info.json`. Unchanged: `data/` (schema, va
 ### `apps`
 | App | Port it depends on | Adapters |
 |---|---|---|
-| `agent` | `ChatBackend` | `QwenBackend` (in-process, today), `OpenAIBackend` (HTTP, new) |
-| `ops_crew` | LLM profiles (`llms.yaml`), `Planner`, `Proposer`, `Refiner` | CrewAI planner + crew, `refiner` via `refinement.py` |
+| `agent` | `ChatBackend`, `memory.TokenCounter`, `memory.Embedder` | `QwenBackend` (in-process, today), `OpenAIBackend` (HTTP, new); hashing or HTTP embeddings |
+| `ops_crew` | LLM profiles (`llms.yaml`), `Planner`, `Proposer`, `Refiner`, `SimilarityIndex`, `EpisodeMemory` | CrewAI planner + crew, `refiner` via `refinement.py`, `memory` via `memory_adapters.py` |
 | `refiner` | PydanticAI `Model` | OpenAI-compatible / Ollama / function model |
+| `memory` | `Embedder`, `TokenCounter` | `HashingEmbedder` (offline), `HttpEmbedder` (any OpenAI-compatible `/embeddings`), `SqliteEpisodeStore` |
 | `chat_ui` | OpenAI HTTP API | any runtime from 3.3 |
 
 ---
@@ -121,9 +122,10 @@ LoRA target layers), recorded in `run_info.json`. Unchanged: `data/` (schema, va
 |---|---|---|---|---|
 | `finetune` | ✅ | ✅ (internal layering as today) | ❌ | ❌ |
 | `model_serving` | ❌ | ❌ | ✅ | ❌ |
-| `apps/ops_crew` | ✅ (dataset rules only) | ❌ | ❌ (HTTP only) | own + `refiner` via `refinement.py` |
-| `apps/agent` | ❌ | only `agent/backends/qwen.py` (in-process adapter) | ❌ (HTTP only) | ❌ |
+| `apps/ops_crew` | ✅ (dataset rules only) | ❌ | ❌ (HTTP only) | own + `refiner` via `refinement.py` + `memory` via `memory_adapters.py` |
+| `apps/agent` | ❌ | only `agent/backends/qwen.py` (in-process adapter) | ❌ (HTTP only) | `memory` |
 | `apps/refiner` | ❌ | ❌ | ❌ | ❌ (pydantic / pydantic_ai only) |
+| `apps/memory` | ❌ | ❌ | ❌ | ❌ (standard library only) |
 | `apps/chat_ui` | ❌ | ❌ | ❌ (HTTP only) | ❌ |
 
 Rules carried over unchanged: `ops_crew/domain` stays plain Python, only `ops_crew/crew`, `flow`,
