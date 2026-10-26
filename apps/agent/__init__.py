@@ -3,8 +3,10 @@
     backend        ChatBackend protocol: complete(messages, tools) -> str
     parser         parse <tool_call>{json}</tool_call> blocks from model output
     tools          Tool, ToolRegistry (schema generation + argument validation)
-    loop           Agent.run(question) -> AgentResult
-    builtin_tools  calculator, current_time, search_knowledge_base
+    loop           Agent.run(question) -> AgentResult; optional context budget (history
+                   compaction) and long-term memory recall
+    builtin_tools  calculator, current_time, search_knowledge_base (BM25 + embeddings)
+    user_memory    opt-in UserMemory: remember(fact) stores only the user's own words
     backends/qwen  adapter for this repo's fine-tuned Qwen models (the only finetune import)
 
 The core modules import nothing from finetune, torch or transformers, so the loop can

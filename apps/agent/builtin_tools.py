@@ -2,17 +2,17 @@
 
     calculator              arithmetic via a whitelisted AST (no eval)
     current_time            local date/time (clock injectable for tests)
-    search_knowledge_base   keyword search over Q&A pairs (e.g. the training data)
+    search_knowledge_base   hybrid (BM25 + embeddings) search over Q&A pairs (e.g. the training data)
 
 Each `make_*` function returns a Tool; `default_registry` wires them together.
 """
 import ast
 import operator
-import re
 from datetime import datetime
 from typing import Callable
 
 from agent.tools import Tool, ToolError, ToolRegistry, make_tool
+from memory import Embedder, HashingEmbedder, HybridRetriever, terms
 
 # ---------------------------------------------------------------- calculator
 
@@ -83,39 +83,32 @@ def make_clock_tool(now: Callable[[], datetime] = lambda: datetime.now().astimez
 
 # ----------------------------------------------------------- knowledge base
 
-_WORD = re.compile(r"[a-z0-9@_.+-]+")
-_STOPWORDS = {"the", "and", "for", "what", "how", "why", "does", "is", "are", "of", "in", "to", "a", "an",
-              "between", "difference", "do", "you", "with", "on", "it", "its", "can", "which", "when"}
-
-
-def _terms(text):
-    return {w.strip(".") for w in _WORD.findall(text.lower()) if len(w) > 1} - _STOPWORDS
-
-
 class KnowledgeBase:
-    """Tiny keyword index over (question, answer) pairs. No embeddings, no dependencies."""
+    """Q&A pairs searched with BM25 plus embeddings (memory.HybridRetriever, Reciprocal Rank Fusion).
 
-    def __init__(self, entries: list[tuple[str, str]]):
+    The default embedder is offline character hashing (finds rewordings that keep the key words);
+    pass any memory.Embedder, e.g. an HttpEmbedder for Ollama / vLLM / OpenAI, for real semantic
+    search. BM25 sees the question twice (field boost: the question states the topic) plus the
+    answer; vectors are built from the question alone (long answers would dilute the topic)."""
+
+    def __init__(self, entries: list[tuple[str, str]], embedder: Embedder | None = None,
+                 min_similarity: float = 0.3):
         self.entries = entries
-        self._question_terms = [_terms(q) for q, _ in entries]
-        self._all_terms = [_terms(q + " " + a) for q, a in entries]
+        self._retriever = HybridRetriever(
+            [(str(i), f"{q}\n{q}\n{a}") for i, (q, a) in enumerate(entries)],
+            embedder or HashingEmbedder(), fallback=HashingEmbedder(), min_similarity=min_similarity,
+            vector_texts=[q for q, _ in entries],
+        )
 
     @classmethod
-    def from_conversations(cls, conversations):
+    def from_conversations(cls, conversations, embedder: Embedder | None = None):
         """Build from chat conversations: the last user question and the final answer."""
-        return cls([(m[-2]["content"], m[-1]["content"]) for m in conversations])
+        return cls([(m[-2]["content"], m[-1]["content"]) for m in conversations], embedder)
 
     def search(self, query: str, top_k: int = 3) -> list[tuple[str, str]]:
-        query_terms = _terms(query)
-        if not query_terms:
+        if not terms(query):  # only stopwords: nothing to look for
             return []
-        # Score = shared terms; question terms count double since they state the topic.
-        scored = []
-        for i, (all_terms, question_terms) in enumerate(zip(self._all_terms, self._question_terms)):
-            score = len(query_terms & all_terms) + len(query_terms & question_terms)
-            if score:
-                scored.append((-score, i))
-        return [self.entries[i] for _, i in sorted(scored)[:top_k]]
+        return [self.entries[int(hit.id)] for hit in self._retriever.search(query, top_k)]
 
 
 def make_search_tool(kb: KnowledgeBase, max_top_k: int = 5) -> Tool:

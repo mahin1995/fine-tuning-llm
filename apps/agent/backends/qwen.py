@@ -33,3 +33,7 @@ class QwenBackend:
 
     def complete(self, messages, tools):
         return self.chat.generate(messages, self.params, tools=tools or None)
+
+    def count(self, text: str) -> int:
+        """Exact token count with the model's tokenizer (memory.TokenCounter), for context budgets."""
+        return len(self.chat.tokenizer.encode(text, add_special_tokens=False))

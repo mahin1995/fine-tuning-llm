@@ -38,3 +38,10 @@ def test_agent_runs_end_to_end_on_tiny_model(tiny_model_dir):
     # A random tiny model won't produce a sensible answer; the loop must still terminate cleanly.
     assert result.stop_reason in ("answer", "max_steps")
     assert result.messages[0] == {"role": "user", "content": "What is 2 + 2?"}
+
+
+def test_backend_counts_tokens_with_the_model_tokenizer(tiny_model_dir):
+    backend = QwenBackend.from_path(tiny_model_dir, device="cpu")
+    text = "What is the N+1 problem?"
+    assert backend.count(text) == len(backend.chat.tokenizer.encode(text, add_special_tokens=False)) > 0
+    assert backend.count("") == 0

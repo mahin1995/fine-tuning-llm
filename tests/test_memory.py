@@ -175,6 +175,14 @@ def test_hybrid_finds_rewordings_that_share_no_keyword():
     assert hybrid.search("tax law", 2) == []  # weak semantic matches stay out (min_similarity)
 
 
+def test_vector_texts_are_embedded_instead_of_the_bm25_text():
+    inner = CountingEmbedder()
+    retriever = HybridRetriever([("a", "boosted boosted text")], inner, vector_texts=["plain text"])
+    assert inner.calls == [["plain text"]] and retriever.text("a") == "boosted boosted text"
+    with pytest.raises(ValueError, match="one text per document"):
+        HybridRetriever([("a", "x")], inner, vector_texts=[])
+
+
 def test_failing_embedder_switches_to_the_fallback_for_good():
     broken = CountingEmbedder(fail=True)
     retriever = HybridRetriever(DOCS, broken, fallback=HashingEmbedder())

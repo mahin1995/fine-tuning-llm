@@ -190,12 +190,18 @@ class HybridRetriever:
     score(d) = sum over rankings of 1 / (rrf_k + rank). Without an embedder it is plain BM25.
 
     `min_similarity` keeps weak semantic matches out of search results (a vector index always
-    returns *something*); `similar()` returns raw cosine scores for threshold decisions."""
+    returns *something*); `similar()` returns raw cosine scores for threshold decisions.
+    `vector_texts` (same order as `docs`) embeds different text than BM25 indexes, e.g. BM25
+    over a boosted "question question answer" and vectors over the plain question."""
 
     def __init__(self, docs: Iterable[tuple[str, str]], embedder: Embedder | None = None, *,
-                 fallback: Embedder | None = None, min_similarity: float = 0.0, rrf_k: int = 60):
+                 fallback: Embedder | None = None, min_similarity: float = 0.0, rrf_k: int = 60,
+                 vector_texts: list[str] | None = None):
         self._docs = list(docs)
         self._texts = {doc_id: text for doc_id, text in self._docs}
+        self._vector_texts = list(vector_texts) if vector_texts is not None else [t for _, t in self._docs]
+        if len(self._vector_texts) != len(self._docs):
+            raise ValueError("vector_texts must have one text per document")
         self.bm25 = Bm25Index(self._docs)
         self.embedder = embedder
         self._fallback = fallback
@@ -204,7 +210,7 @@ class HybridRetriever:
         self.errors: list[str] = []
         self._vectors: list[list[float]] | None = None
         if embedder is not None:
-            self._vectors = self._with_fallback(lambda e: e.embed([text for _, text in self._docs]))
+            self._vectors = self._with_fallback(lambda e: e.embed(self._vector_texts))
 
     def _with_fallback(self, fn):
         try:
@@ -215,7 +221,7 @@ class HybridRetriever:
             self.errors.append(f"{self.embedder.name}: {e}")
             self.embedder = self._fallback  # for good: every vector must come from one model
             if self._vectors is not None:
-                self._vectors = self.embedder.embed([text for _, text in self._docs])
+                self._vectors = self.embedder.embed(self._vector_texts)
             return fn(self.embedder)
 
     def similar(self, text: str, k: int = 3) -> list[Hit]:
