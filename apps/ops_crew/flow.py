@@ -1,0 +1,695 @@
+"""The deterministic pipeline as a CrewAI Flow.
+
+    intake ─► check_input ─┬─ input_invalid ──► reject_input
+                           └─ input_ok ──► propose (crew + validation, retries)
+                                             ├─ needs_escalation ──► escalate
+                                             ├─ low_confidence ────► clarify
+                                             └─ proposal_ready ────► reflect_on_proposal
+                                                                       ├─ needs_escalation ► escalate
+                                                                       └─ reviewed ──► authorize_proposal
+                                                                       ├─ denied ──────────► reject_proposal
+                                                                       ├─ authorized ──────► execute_action
+                                                                       └─ approval_required ► request_approval
+                                                                                               ├─ approved ─► execute_action
+                                                                                               └─ declined ─► decline
+
+With a Refiner (ops_crew/refinement.py, built on the `refiner` package):
+- propose: a malformed or correctable proposal is repaired with feedback-driven retries
+  (self-correction) instead of re-running the whole crew blindly; crew re-runs remain
+  only for transient failures (provider errors, timeouts, broken classification/research)
+- reflect_on_proposal: answers (ask) are critiqued and revised; new examples (add_example)
+  are critiqued only, and a low score turns into reviewer issues -> human approval
+Without a Refiner both steps behave exactly as before (blind retries, no reflection).
+
+Every terminal step writes a "finished" audit record. The flow only orders the steps;
+all decisions are made by functions in ops_crew.domain.
+Route labels deliberately differ from method names (CrewAI 1.15 rejects a label that
+equals a handler name).
+
+With a Planner (FlowDeps.planner), PlanFlow wraps the pipeline above (plan-and-execute):
+
+    intake ─► check_input ─┬─ input_invalid ──► reject_input
+                           └─ input_ok ──► make_plan (planner + checks, repair / retries;
+                                           planner unavailable -> one unplanned step)
+                                             └─ plan_ready ──► gate_plan
+                                                   ├─ plan_denied ─────────► reject_plan
+                                                   ├─ plan_allowed ────────► run_steps
+                                                   └─ plan_needs_approval ─► request_plan_approval
+                                                                               ├─ plan_approved ► run_steps
+                                                                               └─ plan_declined ► decline_plan
+
+run_steps runs every step through OpsFlow above (a subgraph), in plan order, on the user's own
+text for that step; a step whose dependencies did not complete is skipped. A one-step plan is
+exactly the unplanned path. Step correlation ids are <correlation id>.s1, <correlation id>.s2, ...
+"""
+import uuid
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FuturesTimeout
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from typing import Any, Callable
+
+from crewai.flow.flow import Flow, listen, or_, router, start
+from pydantic import BaseModel, Field, PrivateAttr
+
+from ops_crew.domain.actions import ActionExecutor
+from ops_crew.domain.approval import ApprovalGateway, ApprovalRequest
+from ops_crew.domain.audit import AuditLog
+from ops_crew.domain.inputs import InputRejected, clean_request
+from ops_crew.domain.correction import REFLECTED_INTENTS, correctable_problems, reflection_route
+from ops_crew.domain.followup import followup_text, reply_problem
+from ops_crew.domain.idempotency import idempotency_key
+from ops_crew.domain.planning import (
+    SKIPPED,
+    StepResult,
+    blocked_by,
+    describe_plan,
+    plan_gate,
+    plan_hash,
+    plan_message,
+    plan_outcome,
+    plan_problems,
+    step_input,
+)
+from ops_crew.domain.policy import SIDE_EFFECTS, Outcome, authorize
+from ops_crew.domain.ports import (
+    EpisodeMemory,
+    Planner,
+    PlanRepairRequest,
+    Proposer,
+    ProposerError,
+    Refiner,
+    RepairRequest,
+    RequestRecord,
+    SimilarityIndex,
+    SimilarityReport,
+)
+from ops_crew.domain.repository import DatasetRepository
+from ops_crew.domain.validation import PLANNER_TASK_SCHEMAS, OutputValidationError, parse_output, validate_parts, \
+    validate_run
+from ops_crew.domain.working_memory import VerifiedFacts
+from ops_crew.schemas import ActionProposal, Intent, Plan, ResearchFindings, Role, ToolCallRecord, ValidatedRun
+from ops_crew.settings import OpsSettings
+
+PLAN_SCHEMA = PLANNER_TASK_SCHEMAS["plan_request"]
+
+
+@dataclass
+class FlowDeps:
+    proposer: Proposer
+    repo: DatasetRepository
+    executor: ActionExecutor
+    approvals: ApprovalGateway
+    audit: AuditLog
+    settings: OpsSettings
+    new_correlation_id: Callable[[], str] = field(default=lambda: uuid.uuid4().hex[:12])
+    refiner: Refiner | None = None  # None: blind retries, no reflection (original behaviour)
+    planner: Planner | None = None  # None: one request = one intent (no planning)
+    similarity: SimilarityIndex | None = None  # None: no near-duplicate checks (OPS_MEMORY=false)
+    episodes: EpisodeMemory | None = None      # None: no episodic memory (OPS_MEMORY=false)
+    now: Callable[[], datetime] = field(default=lambda: datetime.now(timezone.utc))
+
+
+class OpsState(BaseModel):
+    request: str = ""
+    role: Role = Role.VIEWER
+    request_id: str | None = None
+    correlation_id: str = ""
+    clean_text: str = ""
+    suspicious: bool = False
+    input_error: str | None = None
+    expected_intent: Intent | None = None  # plan step: the intent it was planned (and approved) for
+    inherited_suspicious: bool = False     # plan step: injection markers anywhere in the full request
+    reply_to: str | None = None            # answers the clarifying question of this earlier request
+    attempts: int = 0
+    errors: list[str] = Field(default_factory=list)
+    proposal: ActionProposal | None = None
+    findings: ResearchFindings | None = None
+    repairs: int = 0
+    reflection: dict = Field(default_factory=dict)
+    tool_calls: list[ToolCallRecord] = Field(default_factory=list)
+    decision_reasons: list[str] = Field(default_factory=list)
+    outcome: str = ""
+    message: str = ""
+    data: dict = Field(default_factory=dict)
+
+
+def run_with_timeout(fn: Callable[[], Any], timeout: float, what: str = "crew"):
+    pool = ThreadPoolExecutor(max_workers=1)
+    future = pool.submit(fn)
+    try:
+        return future.result(timeout=timeout)
+    except FuturesTimeout:
+        raise ProposerError(f"{what} timed out after {timeout:g}s") from None
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+
+
+def _reply_text(deps: FlowDeps, reply_to: str, answer: str) -> str:
+    """Join an earlier request, its clarifying question and this answer (episodic memory)."""
+    if deps.episodes is None:
+        raise InputRejected("replies need episodic memory (OPS_MEMORY=true)")
+    record = deps.episodes.get_request(reply_to)
+    problem = reply_problem(record, reply_to, deps.now(), timedelta(minutes=deps.settings.clarification_ttl_minutes))
+    if problem:
+        raise InputRejected(problem)
+    return followup_text(record, answer)
+
+
+def _intake(flow, inherited_suspicious: bool = False) -> None:
+    """Shared first step of both flows: correlation id, request cleanup, injection markers.
+    A reply to a clarifying question is joined with the earlier request first; the joined text
+    is checked like any request (size, cleanup, injection markers over all of it)."""
+    state = flow.state
+    if not state.correlation_id:
+        state.correlation_id = flow._deps.new_correlation_id()
+    reply = {"reply_to": state.reply_to} if state.reply_to else {}
+    try:
+        text = _reply_text(flow._deps, state.reply_to, state.request) if state.reply_to else state.request
+        clean = clean_request(text, flow._deps.settings.max_request_chars)
+    except InputRejected as e:
+        state.input_error = str(e)
+        flow._audit("intake", role=state.role.value, accepted=False, error=str(e), **reply)
+        return
+    state.clean_text = clean.text
+    state.suspicious = clean.suspicious or inherited_suspicious
+    flow._audit("intake", role=state.role.value, accepted=True, chars=len(clean.text),
+                suspicious=state.suspicious, injection_markers=list(clean.markers), **reply)
+
+
+class OpsFlow(Flow[OpsState]):
+    _deps: FlowDeps = PrivateAttr()
+
+    def __init__(self, deps: FlowDeps, **kwargs):
+        super().__init__(**kwargs)
+        self._deps = deps
+
+    # ------------------------------------------------------------------ helpers
+    def _audit(self, step: str, **fields):
+        self._deps.audit.record(self.state.correlation_id, step, **fields)
+
+    def _finish(self, outcome: str, message: str, **data):
+        self.state.outcome = outcome
+        self.state.message = message
+        self.state.data = data
+        self._audit("finished", outcome=outcome, message=message, attempts=self.state.attempts)
+        return outcome
+
+    # -------------------------------------------------------------------- steps
+    @start()
+    def intake(self):
+        _intake(self, self.state.inherited_suspicious)
+
+    @router(intake)
+    def check_input(self):
+        return "input_invalid" if self.state.input_error else "input_ok"
+
+    @listen("input_invalid")
+    def reject_input(self):
+        return self._finish("rejected", f"invalid request: {self.state.input_error}")
+
+    @router("input_ok")
+    def propose(self):
+        if self._deps.refiner is None:
+            return self._propose_with_blind_retries()
+        return self._propose_with_self_correction()
+
+    def _run_crew(self):
+        return run_with_timeout(
+            lambda: self._deps.proposer.propose(self.state.clean_text, self.state.correlation_id),
+            self._deps.settings.crew_timeout_seconds,
+        )
+
+    def _propose_with_self_correction(self):
+        for attempt in range(1, self._deps.settings.max_retries + 2):
+            self.state.attempts = attempt
+            try:
+                run = self._run_crew()
+            except Exception as e:  # transient (provider, timeout): re-running the crew is the right fix
+                self._attempt_failed(attempt, type(e).__name__, str(e))
+                continue
+            parts = validate_parts(run)
+            if not parts.context_ok:  # without a valid classification + research there is nothing to repair
+                self._attempt_failed(attempt, "OutputValidationError", "; ".join(parts.errors.values()))
+                continue
+            facts = VerifiedFacts.from_tool_calls(run.tool_calls)
+            if parts.proposal is None:
+                problems, previous = [parts.errors["review_proposal"]], run.outputs.get("review_proposal", "")
+            else:
+                problems = correctable_problems(parts.proposal, parts.classification, self.state.clean_text, facts)
+                previous = parts.proposal.model_dump_json()
+            proposal = parts.proposal
+            if problems:
+                proposal = self._repair(RepairRequest(self.state.clean_text, parts.classification, parts.findings,
+                                                      previous, problems, facts))
+                if proposal is None:
+                    return "needs_escalation"
+            return self._accept(ValidatedRun(classification=parts.classification, findings=parts.findings,
+                                             proposal=proposal, tool_calls=run.tool_calls))
+        return "needs_escalation"
+
+    def _repair(self, req: RepairRequest) -> ActionProposal | None:
+        self._audit("self_correction_started", problems=req.problems)
+        try:
+            proposal = run_with_timeout(lambda: self._deps.refiner.repair(req),
+                                        self._deps.settings.crew_timeout_seconds)
+        except Exception as e:  # RefinementError, timeout, provider errors
+            self.state.errors.append(f"self-correction failed: {type(e).__name__}: {e}")
+            self._audit("self_correction_failed", error_type=type(e).__name__, error=str(e)[:500])
+            return None
+        self.state.repairs += 1
+        self._audit("self_correction_succeeded", intent=proposal.intent.value)
+        return proposal
+
+    def _propose_with_blind_retries(self):
+        settings = self._deps.settings
+        for attempt in range(1, settings.max_retries + 2):
+            self.state.attempts = attempt
+            try:
+                run = run_with_timeout(
+                    lambda: self._deps.proposer.propose(self.state.clean_text, self.state.correlation_id),
+                    settings.crew_timeout_seconds,
+                )
+                validated = validate_run(run)
+            except Exception as e:  # ProposerError, OutputValidationError, SDK errors: never crash the pipeline
+                self._attempt_failed(attempt, type(e).__name__, str(e))
+                continue
+            return self._accept(validated)
+        return "needs_escalation"
+
+    def _attempt_failed(self, attempt, kind, detail):
+        self.state.errors.append(f"attempt {attempt}: {kind}: {detail}")
+        self._audit("crew_attempt_failed", attempt=attempt, error_type=kind, error=detail[:500])
+
+    def _accept(self, validated: ValidatedRun):
+        proposal = validated.proposal
+        self.state.proposal = proposal
+        self.state.findings = validated.findings
+        self.state.tool_calls = validated.tool_calls
+        confidence = min(proposal.confidence, validated.classification.confidence)
+        self._audit("proposal_validated", intent=proposal.intent.value, confidence=confidence,
+                    issues=proposal.issues, tool_calls=[c.model_dump() for c in validated.tool_calls])
+        if confidence < self._deps.settings.confidence_threshold:
+            question = proposal.clarifying_question or validated.classification.clarifying_question
+            self.state.message = question or ""
+            return "low_confidence" if question else "needs_escalation"
+        if proposal.intent == Intent.UNKNOWN and proposal.clarifying_question:
+            self.state.message = proposal.clarifying_question
+            return "low_confidence"
+        expected = self.state.expected_intent
+        if expected is not None and proposal.intent != expected:  # never run what the plan gate didn't see
+            self.state.errors.append(f"step was planned as '{expected.value}' but the crew proposed "
+                                     f"'{proposal.intent.value}'")
+            return "needs_escalation"
+        return "proposal_ready"
+
+    @listen("low_confidence")
+    def clarify(self):
+        return self._finish("clarification_needed", self.state.message)
+
+    @listen("needs_escalation")
+    def escalate(self):
+        reason = "; ".join(self.state.errors) or "confidence below threshold and no clarifying question"
+        return self._finish("escalated", f"escalated to a human: {reason}")
+
+    @router("proposal_ready")
+    def reflect_on_proposal(self):
+        proposal = self.state.proposal
+        if self._deps.refiner is None or proposal.intent not in REFLECTED_INTENTS:
+            return "reviewed"
+        refiner = self._deps.refiner
+        review = refiner.review_answer if proposal.intent == Intent.ASK else refiner.assess_example
+        try:
+            outcome = run_with_timeout(lambda: review(self.state.clean_text, proposal, self.state.findings),
+                                       self._deps.settings.crew_timeout_seconds)
+        except Exception as e:  # reflection is a quality gate; policy still decides everything
+            self._audit("reflection_failed", error_type=type(e).__name__, error=str(e)[:500])
+            return "reviewed"
+        self.state.reflection = {"score": outcome.score, "accepted": outcome.accepted,
+                                 "stop_reason": outcome.stop_reason, "rounds": outcome.rounds,
+                                 "issues": outcome.issues}
+        self._audit("reflection", intent=proposal.intent.value, **self.state.reflection)
+
+        if proposal.intent == Intent.ASK:
+            if reflection_route(proposal.intent, outcome) == "escalate":
+                self.state.errors.append(f"answer quality below threshold (score {outcome.score:.2f}): "
+                                         + "; ".join(outcome.issues))
+                return "needs_escalation"
+            self.state.proposal = outcome.proposal
+        elif not outcome.accepted and outcome.score is not None:
+            notes = [f"quality review (score {outcome.score:.2f}): {i}" for i in outcome.issues] or \
+                [f"quality review score {outcome.score:.2f} is below the threshold"]
+            self.state.proposal = proposal.model_copy(update={"issues": proposal.issues + notes})
+        return "reviewed"
+
+    def _similarity(self, proposal: ActionProposal) -> SimilarityReport | None:
+        """How close a new example is to the training and eval data (semantic memory)."""
+        if self._deps.similarity is None or proposal.intent != Intent.ADD_EXAMPLE or not proposal.params.question:
+            return None
+        try:
+            report = self._deps.similarity.report(proposal.params.question)
+        except Exception as e:  # never skip the check silently: policy asks a human instead
+            report = SimilarityReport.unavailable(f"{type(e).__name__}: {e}"[:300])
+        closest = report.closest_example
+        self._audit("similarity", embedder=report.embedder, error=report.error,
+                    closest_example=closest.example_id if closest else None,
+                    score=round(closest.score, 3) if closest else None, eval_score=round(report.eval_score, 3))
+        return report
+
+    def _declined_before(self, proposal: ActionProposal) -> datetime | None:
+        """Episodic memory: did a human decline this exact action before? (Fails open: without
+        the memory, the action is judged exactly as before Level 2.)"""
+        if self._deps.episodes is None or proposal.intent not in SIDE_EFFECTS:
+            return None
+        try:
+            return self._deps.episodes.declined_before(idempotency_key(proposal))
+        except Exception as e:
+            self._audit("memory_read_failed", error_type=type(e).__name__, error=str(e)[:300])
+            return None
+
+    @router("reviewed")
+    def authorize_proposal(self):
+        proposal = self.state.proposal
+        decision = authorize(proposal, self.state.role, self._deps.repo,
+                             suspicious_input=self.state.suspicious,
+                             already_executed=self._deps.executor.already_executed(proposal, self.state.request_id),
+                             similarity=self._similarity(proposal), declined_at=self._declined_before(proposal))
+        self.state.decision_reasons = decision.reasons
+        self._audit("authorization", decision=decision.outcome.value, reasons=decision.reasons)
+        return {Outcome.ALLOW: "authorized", Outcome.DENY: "denied",
+                Outcome.NEEDS_APPROVAL: "approval_required"}[decision.outcome]
+
+    @listen("denied")
+    def reject_proposal(self):
+        return self._finish("rejected", "; ".join(self.state.decision_reasons))
+
+    @router("approval_required")
+    def request_approval(self):
+        proposal = self.state.proposal
+        params = proposal.params.model_dump(exclude_none=True)
+        approved = self._deps.approvals.request(ApprovalRequest(
+            correlation_id=self.state.correlation_id,
+            intent=proposal.intent.value,
+            summary=f"{proposal.intent.value} {params}",
+            reasons=tuple(self.state.decision_reasons),
+        ))
+        self._audit("approval", approved=approved)
+        return "approved" if approved else "declined"
+
+    @listen("declined")
+    def decline(self):
+        if self._deps.episodes is not None:  # remembered: the same action needs a human next time too
+            try:
+                self._deps.episodes.record_decline(idempotency_key(self.state.proposal), self.state.correlation_id,
+                                                   self._deps.now())
+            except Exception as e:
+                self._audit("memory_write_failed", error_type=type(e).__name__, error=str(e)[:300])
+        return self._finish("declined", "a human declined the action")
+
+    @listen(or_("authorized", "approved"))
+    def execute_action(self):
+        try:
+            result = self._deps.executor.execute(self.state.proposal, self.state.request_id)
+        except Exception as e:  # e.g. the example vanished between authorization and execution
+            self._audit("execution_failed", error_type=type(e).__name__, error=str(e)[:500])
+            return self._finish("failed", f"execution failed: {type(e).__name__}: {e}")
+        self._audit("executed", status=result.status, idempotency_key=result.idempotency_key, data=result.data)
+        return self._finish("completed", result.message, status=result.status, **result.data)
+
+
+@dataclass(frozen=True)
+class OpsResult:
+    correlation_id: str
+    outcome: str
+    message: str
+    data: dict
+    attempts: int
+    errors: list[str]
+    intent: str | None
+    params: dict  # the final proposal's parameters (empty if there was no valid proposal)
+    tool_calls: list[ToolCallRecord]
+    repairs: int = 0          # successful self-corrections
+    reflection: dict | None = None
+    planned: bool = False     # a checked plan was used (False: no planner, or it was unavailable)
+    plan: dict | None = None  # hash, steps, attempts and repairs of that plan
+    steps: list[StepResult] = field(default_factory=list)  # PlanFlow: one result per step, in plan order
+    request: str = ""         # the cleaned request that ran (for a reply: joined with the earlier one)
+
+
+class PlanState(BaseModel):
+    request: str = ""
+    role: Role = Role.VIEWER
+    request_id: str | None = None
+    correlation_id: str = ""
+    clean_text: str = ""
+    suspicious: bool = False
+    input_error: str | None = None
+    reply_to: str | None = None
+    plan: Plan | None = None  # None: no usable plan, the request runs as one unplanned step
+    plan_attempts: int = 0
+    plan_repairs: int = 0
+    plan_errors: list[str] = Field(default_factory=list)
+    decision_reasons: list[str] = Field(default_factory=list)
+    outcome: str = ""
+    message: str = ""
+
+
+class PlanFlow(Flow[PlanState]):
+    """Plan-and-execute: the planner proposes steps, code checks and gates the plan, and every
+    step runs through OpsFlow. Decisions are made by ops_crew.domain.planning."""
+    _deps: FlowDeps = PrivateAttr()
+    _runs: list = PrivateAttr(default_factory=list)  # (StepResult, OpsResult | None) per step, in plan order
+
+    def __init__(self, deps: FlowDeps, **kwargs):
+        super().__init__(**kwargs)
+        self._deps = deps
+        self._runs = []
+
+    # ------------------------------------------------------------------ helpers
+    def _audit(self, step: str, **fields):
+        self._deps.audit.record(self.state.correlation_id, step, **fields)
+
+    def _finish(self, outcome: str, message: str):
+        self.state.outcome = outcome
+        self.state.message = message
+        self._audit("finished", outcome=outcome, message=message, steps=len(self._runs))
+        return outcome
+
+    # -------------------------------------------------------------------- steps
+    @start()
+    def intake(self):
+        _intake(self)
+
+    @router(intake)
+    def check_input(self):
+        return "input_invalid" if self.state.input_error else "input_ok"
+
+    @listen("input_invalid")
+    def reject_input(self):
+        return self._finish("rejected", f"invalid request: {self.state.input_error}")
+
+    @router("input_ok")
+    def make_plan(self):
+        plan = self._plan()
+        if plan is None:  # planning only adds abilities: without a plan the request runs unplanned, as before
+            self._audit("planning_failed", errors=self.state.plan_errors, fallback="unplanned")
+        else:
+            self.state.plan = plan
+            self._audit("plan_validated", plan_hash=plan_hash(plan), attempts=self.state.plan_attempts,
+                        repairs=self.state.plan_repairs,
+                        steps=[{"id": st.id, "intent": st.intent.value, "depends_on": st.depends_on}
+                               for st in plan.steps])
+        return "plan_ready"
+
+    def _plan(self) -> Plan | None:
+        settings = self._deps.settings
+        for attempt in range(1, settings.max_retries + 2):
+            self.state.plan_attempts = attempt
+            try:
+                raw = run_with_timeout(
+                    lambda: self._deps.planner.plan(self.state.clean_text, self.state.correlation_id),
+                    settings.crew_timeout_seconds, what="planner")
+            except Exception as e:  # PlannerError, timeout, provider errors: ask the planner again
+                self._planning_attempt_failed(attempt, type(e).__name__, str(e))
+                continue
+            try:
+                plan = parse_output(raw, PLAN_SCHEMA)
+            except OutputValidationError as e:
+                problems, previous = [str(e)], raw
+            else:
+                problems, previous = plan_problems(plan, self.state.clean_text), plan.model_dump_json()
+            if not problems:
+                return plan
+            if self._deps.refiner is None:
+                self._planning_attempt_failed(attempt, "PlanValidationError", "; ".join(problems))
+                continue
+            return self._repair_plan(PlanRepairRequest(self.state.clean_text, previous, problems))
+        return None
+
+    def _planning_attempt_failed(self, attempt, kind, detail):
+        self.state.plan_errors.append(f"planning attempt {attempt}: {kind}: {detail}")
+        self._audit("planning_attempt_failed", attempt=attempt, error_type=kind, error=detail[:500])
+
+    def _repair_plan(self, req: PlanRepairRequest) -> Plan | None:
+        self._audit("plan_self_correction_started", problems=req.problems)
+        try:
+            plan = run_with_timeout(lambda: self._deps.refiner.repair_plan(req),
+                                    self._deps.settings.crew_timeout_seconds, what="plan repair")
+        except Exception as e:  # RefinementError, timeout, provider errors
+            self.state.plan_errors.append(f"plan self-correction failed: {type(e).__name__}: {e}")
+            self._audit("plan_self_correction_failed", error_type=type(e).__name__, error=str(e)[:500])
+            return None
+        problems = plan_problems(plan, req.request)  # a repaired plan is checked like any other
+        if problems:
+            self.state.plan_errors.append("plan self-correction returned an invalid plan: " + "; ".join(problems))
+            self._audit("plan_self_correction_failed", error_type="PlanValidationError", error="; ".join(problems))
+            return None
+        self.state.plan_repairs += 1
+        self._audit("plan_self_correction_succeeded", steps=len(plan.steps))
+        return plan
+
+    @router("plan_ready")
+    def gate_plan(self):
+        plan = self.state.plan
+        if plan is None:
+            return "plan_allowed"  # one unplanned step: the regular pipeline decides everything
+        decision = plan_gate(plan, self.state.role, max_steps=self._deps.settings.max_plan_steps,
+                             suspicious=self.state.suspicious)
+        self.state.decision_reasons = decision.reasons
+        self._audit("plan_authorization", decision=decision.outcome.value, reasons=decision.reasons,
+                    plan_hash=plan_hash(plan))
+        return {Outcome.ALLOW: "plan_allowed", Outcome.DENY: "plan_denied",
+                Outcome.NEEDS_APPROVAL: "plan_needs_approval"}[decision.outcome]
+
+    @listen("plan_denied")
+    def reject_plan(self):
+        return self._finish("rejected", "; ".join(self.state.decision_reasons))
+
+    @router("plan_needs_approval")
+    def request_plan_approval(self):
+        plan = self.state.plan
+        digest = plan_hash(plan)
+        steps = describe_plan(plan, self.state.clean_text).replace("\n", "\n  ")
+        approved = self._deps.approvals.request(ApprovalRequest(
+            correlation_id=self.state.correlation_id,
+            intent="plan",
+            summary=f"{len(plan.steps)} steps [{digest}]\n  {steps}",
+            reasons=tuple(self.state.decision_reasons),
+        ))
+        self._audit("plan_approval", approved=approved, plan_hash=digest)
+        return "plan_approved" if approved else "plan_declined"
+
+    @listen("plan_declined")
+    def decline_plan(self):
+        return self._finish("declined", "a human declined the plan")
+
+    @listen(or_("plan_allowed", "plan_approved"))
+    def run_steps(self):
+        plan = self.state.plan
+        if plan is None:
+            self._run_step("s1", None, self.state.clean_text, None)
+        else:
+            results: dict[str, StepResult] = {}
+            for step in plan.steps:
+                blocked = blocked_by(step, results)
+                if blocked:
+                    results[step.id] = self._skip_step(step.id, step.intent.value, blocked)
+                    continue
+                text, expected = step_input(plan, step, self.state.clean_text)
+                results[step.id] = self._run_step(step.id, step.intent.value, text, expected)
+        step_results = [result for result, _ in self._runs]
+        return self._finish(plan_outcome(step_results), plan_message(step_results))
+
+    def _run_step(self, step_id: str, planned_intent: str | None, text: str, expected: Intent | None) -> StepResult:
+        run = run_single(self._deps, text, self.state.role, self.state.request_id,
+                         correlation_id=f"{self.state.correlation_id}.{step_id}", expected_intent=expected,
+                         inherited_suspicious=self.state.suspicious)
+        result = StepResult(step_id, planned_intent, run.outcome, run.message, run.correlation_id, dict(run.data))
+        self._runs.append((result, run))
+        self._audit("step_finished", plan_step=step_id, outcome=run.outcome, step_correlation_id=run.correlation_id)
+        return result
+
+    def _skip_step(self, step_id: str, planned_intent: str, blocked: list[str]) -> StepResult:
+        result = StepResult(step_id, planned_intent, SKIPPED, f"not run: {', '.join(blocked)} did not complete")
+        self._runs.append((result, None))
+        self._audit("step_skipped", plan_step=step_id, blocked_by=blocked)
+        return result
+
+
+def run_single(deps: FlowDeps, request: str, role: Role, request_id: str | None = None, *,
+               correlation_id: str | None = None, expected_intent: Intent | None = None,
+               inherited_suspicious: bool = False, reply_to: str | None = None) -> OpsResult:
+    """One request, one intent: the OpsFlow pipeline. PlanFlow runs every step through it."""
+    flow = OpsFlow(deps, suppress_flow_events=True)
+    flow.kickoff(inputs={"request": request, "role": role.value, "request_id": request_id,
+                         "correlation_id": correlation_id or "", "expected_intent": expected_intent,
+                         "inherited_suspicious": inherited_suspicious, "reply_to": reply_to})
+    s = flow.state
+    return OpsResult(
+        correlation_id=s.correlation_id, outcome=s.outcome, message=s.message, data=dict(s.data),
+        attempts=s.attempts, errors=list(s.errors), intent=s.proposal.intent.value if s.proposal else None,
+        params=s.proposal.params.model_dump(exclude_none=True) if s.proposal else {},
+        tool_calls=list(s.tool_calls), repairs=s.repairs, reflection=dict(s.reflection) or None,
+        request=s.clean_text,
+    )
+
+
+def run_plan(deps: FlowDeps, request: str, role: Role, request_id: str | None = None, *,
+             reply_to: str | None = None) -> OpsResult:
+    """Plan first (PlanFlow), then run the steps. A one-step result is reported exactly like an
+    unplanned run; several steps report their results in `steps`."""
+    flow = PlanFlow(deps, suppress_flow_events=True)
+    flow.kickoff(inputs={"request": request, "role": role.value, "request_id": request_id, "reply_to": reply_to})
+    s = flow.state
+    steps = [result for result, _ in flow._runs]
+    runs = [run for _, run in flow._runs if run is not None]
+    only = runs[0] if len(steps) == 1 and runs else None
+    errors = list(s.plan_errors)
+    if only is not None:
+        errors += only.errors
+    else:
+        errors += [f"{result.step_id}: {e}" for result, run in flow._runs if run is not None for e in run.errors]
+    plan = None
+    if s.plan is not None:
+        plan = {"hash": plan_hash(s.plan), "steps": [st.model_dump(mode="json") for st in s.plan.steps],
+                "rationale": s.plan.rationale, "attempts": s.plan_attempts, "repairs": s.plan_repairs}
+    return OpsResult(
+        correlation_id=s.correlation_id, outcome=s.outcome, message=s.message,
+        data=dict(only.data) if only else {}, attempts=sum(r.attempts for r in runs), errors=errors,
+        intent=only.intent if only else None, params=dict(only.params) if only else {},
+        tool_calls=[c for r in runs for c in r.tool_calls], repairs=sum(r.repairs for r in runs),
+        reflection=only.reflection if only else None, planned=s.plan is not None, plan=plan, steps=steps,
+        request=s.clean_text,
+    )
+
+
+def _remember(deps: FlowDeps, result: OpsResult, role: Role, reply_to: str | None) -> None:
+    """Episodic memory: one record per finished request, written by code. A request that never
+    got past intake (invalid input, an unacceptable reply) is not worth remembering."""
+    if deps.episodes is None or not result.request:
+        return
+    record = RequestRecord(
+        correlation_id=result.correlation_id, ts=deps.now(), role=role.value, request=result.request,
+        outcome=result.outcome, message=result.message, intent=result.intent,
+        plan_intents=tuple(st["intent"] for st in result.plan["steps"]) if result.plan else (),
+        step_outcomes=tuple(st.outcome for st in result.steps),
+        reflection_score=(result.reflection or {}).get("score"), reply_to=reply_to,
+    )
+    try:
+        deps.episodes.record_request(record)
+    except Exception as e:  # memory must never fail a request that already ran
+        deps.audit.record(result.correlation_id, "memory_write_failed", error_type=type(e).__name__,
+                          error=str(e)[:300])
+
+
+def run_request(deps: FlowDeps, request: str, role: Role, request_id: str | None = None, *,
+                reply_to: str | None = None) -> OpsResult:
+    """Entry point: planned (PlanFlow) when deps.planner is set, otherwise one request with one
+    intent (OpsFlow). `reply_to`: the correlation id of an earlier request that asked a
+    clarifying question; this request is the answer (needs episodic memory)."""
+    if deps.planner is None:
+        result = run_single(deps, request, role, request_id, reply_to=reply_to)
+    else:
+        result = run_plan(deps, request, role, request_id, reply_to=reply_to)
+    _remember(deps, result, role, reply_to)
+    return result
