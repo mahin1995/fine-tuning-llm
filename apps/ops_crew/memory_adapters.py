@@ -3,19 +3,32 @@
 The only ops_crew module that imports `memory` (enforced by tests/test_architecture.py); the
 domain and the flow see the ports in domain/ports.py. Configuration: config/memory.yaml.
 
-    DatasetSimilarity   SimilarityIndex over the training and eval questions
+    DatasetSimilarity    SimilarityIndex over the training and eval questions
+    SqliteEpisodeMemory  EpisodeMemory: finished requests and human declines (state_dir/memory.db)
+    cluster_requests     group similar request texts (consolidation)
 """
 import os
 import threading
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
-from memory import CachedEmbedder, Embedder, HashingEmbedder, HttpEmbedder, HybridRetriever
+from memory import (
+    CachedEmbedder,
+    Embedder,
+    EmbeddingError,
+    Episode,
+    HashingEmbedder,
+    HttpEmbedder,
+    HybridRetriever,
+    SqliteEpisodeStore,
+    cluster,
+)
 from ops_crew.crew.config import ConfigError, expand_env
-from ops_crew.domain.ports import SimilarExample, SimilarityReport
+from ops_crew.domain.ports import RequestRecord, SimilarExample, SimilarityReport
 from ops_crew.domain.repository import DatasetRepository
 
 
@@ -34,11 +47,17 @@ class EmbeddingsConfig(_Strict):
 class Thresholds(_Strict):
     near_duplicate: float = Field(ge=0, le=1)
     near_eval: float = Field(ge=0, le=1)
+    cluster: float = Field(default=0.5, ge=0, le=1)  # consolidation: group failed requests this similar
+
+
+class EpisodesConfig(_Strict):
+    retention_days: dict[Literal["request", "decline"], int]
 
 
 class MemoryConfig(_Strict):
     embeddings: EmbeddingsConfig
     similarity: dict[Literal["hashing", "openai_compatible"], Thresholds]
+    episodes: EpisodesConfig
 
 
 def load_memory_config(config_dir: Path, env: dict | None = None) -> MemoryConfig:
@@ -135,3 +154,64 @@ class DatasetSimilarity:
             near_eval_threshold=self._thresholds_for(evals.embedder).near_eval,
             embedder=train.embedder.name,
         )
+
+
+# ------------------------------------------------------------------ episodes
+
+REQUEST, DECLINE = "request", "decline"
+
+
+class SqliteEpisodeMemory:
+    """EpisodeMemory on memory.SqliteEpisodeStore. Requests are keyed by correlation id, declines
+    by the declined action's idempotency key (without request id), so the same action is
+    recognised in any later request."""
+
+    def __init__(self, path: Path):
+        self.store = SqliteEpisodeStore(path)
+
+    def record_request(self, record: RequestRecord) -> None:
+        self.store.add(Episode(
+            id=record.correlation_id, kind=REQUEST, ts=record.ts, key=record.reply_to or "", text=record.request,
+            outcome=record.outcome,
+            data={"role": record.role, "message": record.message, "intent": record.intent,
+                  "plan_intents": list(record.plan_intents), "step_outcomes": list(record.step_outcomes),
+                  "reflection_score": record.reflection_score, "reply_to": record.reply_to},
+        ))
+
+    @staticmethod
+    def _record(episode: Episode) -> RequestRecord:
+        d = episode.data
+        return RequestRecord(
+            correlation_id=episode.id, ts=episode.ts, role=d["role"], request=episode.text, outcome=episode.outcome,
+            message=d["message"], intent=d["intent"], plan_intents=tuple(d["plan_intents"]),
+            step_outcomes=tuple(d["step_outcomes"]), reflection_score=d["reflection_score"], reply_to=d["reply_to"],
+        )
+
+    def get_request(self, correlation_id: str) -> RequestRecord | None:
+        episode = self.store.get(correlation_id)
+        return self._record(episode) if episode is not None and episode.kind == REQUEST else None
+
+    def requests(self, since: datetime | None = None) -> list[RequestRecord]:
+        """Newest first."""
+        return [self._record(e) for e in self.store.find(REQUEST, since=since, limit=1_000_000)]
+
+    def record_decline(self, action_key: str, correlation_id: str, ts: datetime) -> None:
+        self.store.add(Episode(id=f"{correlation_id}:{action_key}", kind=DECLINE, ts=ts, key=action_key))
+
+    def declined_before(self, action_key: str) -> datetime | None:
+        episode = self.store.latest(DECLINE, action_key)
+        return episode.ts if episode is not None else None
+
+    def prune(self, now: datetime, retention_days: dict[str, int]) -> dict[str, int]:
+        """Forget episodes past their retention; declines usually live longer than requests."""
+        return {kind: self.store.prune(kind, older_than=now - timedelta(days=days))
+                for kind, days in retention_days.items()}
+
+
+def cluster_requests(texts: list[str], config: MemoryConfig, env: dict | None = None) -> list[list[int]]:
+    """Group similar request texts with the configured embedder (hashing if it is unavailable)."""
+    embedder = build_embedder(config.embeddings, env)
+    try:
+        return cluster(texts, embedder, config.similarity[config.embeddings.provider].cluster)
+    except EmbeddingError:
+        return cluster(texts, HashingEmbedder(), config.similarity["hashing"].cluster)

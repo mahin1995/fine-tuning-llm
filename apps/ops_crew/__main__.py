@@ -4,6 +4,7 @@
     python -m ops_crew --role editor "Add Q: What is a Spring profile? A: A named set of beans ..."
     python -m ops_crew --role admin "Remove the example about bean scopes"     # asks for approval
     python -m ops_crew --role admin "Remove the N+1 example and add: Q: ... A: ..."  # planned: 2 steps
+    python -m ops_crew --role admin --reply-to 3f2a9c1b7d4e "the one about bean scopes"  # answer a question
     OPS_LLM_PROFILE=openai python -m ops_crew --json "What does REQUIRES_NEW do?"
 
 The role comes from the caller (here: the CLI flag; in a service: authentication), never
@@ -56,11 +57,12 @@ def build_deps(settings: OpsSettings, *, interactive: bool, log_to_stderr: bool,
         "-", "llm_fallback", model=model, error=f"{type(err).__name__}: {err}"[:300]))
     llms.check()
     repo = DatasetRepository(settings.train_data, settings.eval_data)
-    similarity = None
+    similarity = episodes = None
     if settings.memory:
-        from ops_crew.memory_adapters import DatasetSimilarity, load_memory_config
+        from ops_crew.memory_adapters import DatasetSimilarity, SqliteEpisodeMemory, load_memory_config
 
         similarity = DatasetSimilarity.from_config(repo, load_memory_config(settings.config_dir, env), env)
+        episodes = SqliteEpisodeMemory(settings.memory_db_path)
     refiner = None
     if settings.refine:
         from ops_crew.refinement import PydanticAIRefiner
@@ -76,6 +78,7 @@ def build_deps(settings: OpsSettings, *, interactive: bool, log_to_stderr: bool,
         refiner=refiner,
         planner=CrewPlanner(config, llms, verbose=verbose) if settings.planning else None,
         similarity=similarity,
+        episodes=episodes,
     )
 
 
@@ -85,6 +88,8 @@ def main(argv=None):
     p.add_argument("request", help="what you want, in plain language")
     p.add_argument("--role", choices=[r.value for r in Role], default=Role.VIEWER.value)
     p.add_argument("--request-id", default=None, help="idempotency scope; reuse to make a retry a no-op")
+    p.add_argument("--reply-to", default=None, metavar="CORRELATION_ID",
+                   help="answer the clarifying question an earlier request asked (episodic memory)")
     p.add_argument("--json", action="store_true", help="print the result as JSON")
     p.add_argument("--log", action="store_true", help="also print audit records to stderr")
     p.add_argument("--verbose", action="store_true", help="print CrewAI agent output")
@@ -101,7 +106,7 @@ def main(argv=None):
     except ConfigError as e:
         print(f"configuration error: {e}", file=sys.stderr)
         return 2
-    result = run_request(deps, args.request, Role(args.role), args.request_id)
+    result = run_request(deps, args.request, Role(args.role), args.request_id, reply_to=args.reply_to)
 
     if args.json:
         print(json.dumps(asdict(result), indent=2, ensure_ascii=False, default=str))
@@ -113,6 +118,9 @@ def main(argv=None):
         print(f"[{result.outcome}] {result.message}")
     if not args.json:
         print(f"correlation id: {result.correlation_id} (audit log: {settings.audit_log_path})", file=sys.stderr)
+        if result.outcome == "clarification_needed" and deps.episodes is not None:
+            print(f'answer with: python -m ops_crew --role {args.role} --reply-to {result.correlation_id} "..."',
+                  file=sys.stderr)
     return 0 if result.outcome in OK_OUTCOMES else 1
 
 

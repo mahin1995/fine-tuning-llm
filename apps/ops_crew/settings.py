@@ -24,12 +24,17 @@ class OpsSettings(BaseSettings):
     llm_profile: str | None = None  # override every agent's LLM profile (see config/llms.yaml)
     refine: bool = True  # self-correction + reflection via the refiner package (config/refine.yaml)
     planning: bool = True  # split multi-action requests into steps first (config/planner.yaml)
-    memory: bool = True    # semantic search, near-duplicate checks (config/memory.yaml)
+    memory: bool = True    # semantic + episodic memory (config/memory.yaml, state_dir/memory.db)
+    clarification_ttl_minutes: int = Field(default=60, ge=1)  # how long --reply-to can answer a question
     max_plan_steps: int = Field(default=4, ge=1, le=9)  # more actions in one request are rejected
 
     @property
     def audit_log_path(self) -> Path:
         return self.state_dir / "audit.jsonl"
+
+    @property
+    def memory_db_path(self) -> Path:
+        return self.state_dir / "memory.db"
 
     @property
     def idempotency_path(self) -> Path:

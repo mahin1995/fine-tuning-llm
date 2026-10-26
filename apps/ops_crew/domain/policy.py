@@ -1,6 +1,7 @@
 """Authorization and business rules. All decisions are made here, in code; prompts never
 decide what is allowed."""
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import StrEnum
 
 from ops_crew.domain.ports import SimilarityReport
@@ -81,11 +82,12 @@ def similarity_reasons(report: SimilarityReport) -> list[str]:
 
 def authorize(proposal: ActionProposal, role: Role, repo: DatasetRepository, *,
               suspicious_input: bool = False, already_executed: bool = False,
-              similarity: SimilarityReport | None = None) -> Decision:
+              similarity: SimilarityReport | None = None, declined_at: datetime | None = None) -> Decision:
     """`already_executed`: the idempotency store holds a result for this exact action. The role
     is still checked, but data rules (e.g. "duplicate example") are skipped: the action already
     happened, and the executor will replay its stored result instead of running it again.
-    `similarity`: for add_example, how close the question is to existing and eval questions."""
+    `similarity`: for add_example, how close the question is to existing and eval questions.
+    `declined_at`: episodic memory says a human declined this exact action before."""
     required = REQUIRED_ROLE.get(proposal.intent)
     if required is None:
         return Decision(Outcome.DENY, [f"intent {proposal.intent.value!r} is not supported"])
@@ -107,6 +109,8 @@ def authorize(proposal: ActionProposal, role: Role, repo: DatasetRepository, *,
         reasons.append("reviewer raised issues: " + "; ".join(proposal.issues))
     if proposal.intent == Intent.ADD_EXAMPLE and similarity is not None:
         reasons += similarity_reasons(similarity)
+    if proposal.intent in SIDE_EFFECTS and declined_at is not None:
+        reasons.append(f"a human declined this exact action on {declined_at:%Y-%m-%d %H:%M} UTC")
     if reasons:
         return Decision(Outcome.NEEDS_APPROVAL, reasons)
     return Decision(Outcome.ALLOW, ["all checks passed"])

@@ -39,7 +39,8 @@ def similarity(repo):
 def test_repo_memory_config_defaults_to_offline_hashing():
     config = load_memory_config(CONFIG_DIR, env={})
     assert config.embeddings.provider == "hashing" and config.embeddings.base_url == "http://localhost:11434/v1"
-    assert config.similarity["hashing"] == Thresholds(near_duplicate=0.6, near_eval=0.6)
+    assert config.similarity["hashing"] == Thresholds(near_duplicate=0.6, near_eval=0.6, cluster=0.5)
+    assert config.episodes.retention_days == {"request": 30, "decline": 180}
     assert isinstance(build_embedder(config.embeddings, env={}), HashingEmbedder)
 
 
@@ -54,7 +55,8 @@ def test_memory_config_from_env():
 
 @pytest.mark.parametrize("mutate, error", [
     (lambda s: s.replace("${OPS_EMBED_PROVIDER:-hashing}", "word2vec"), "provider"),
-    (lambda s: s.replace("  hashing: {near_duplicate: 0.6, near_eval: 0.6}\n", ""), "thresholds needed for 'hashing'"),
+    (lambda s: s.replace("  hashing: {near_duplicate: 0.6, near_eval: 0.6, cluster: 0.5}\n", ""),
+     "thresholds needed for 'hashing'"),
     (lambda s: s.replace("near_duplicate: 0.6", "near_duplicate: 1.5"), "less than or equal to 1"),
 ])
 def test_memory_config_errors_fail_fast(tmp_path, mutate, error):

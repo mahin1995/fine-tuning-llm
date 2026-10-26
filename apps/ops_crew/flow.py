@@ -46,6 +46,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeout
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
 from crewai.flow.flow import Flow, listen, or_, router, start
@@ -56,6 +57,8 @@ from ops_crew.domain.approval import ApprovalGateway, ApprovalRequest
 from ops_crew.domain.audit import AuditLog
 from ops_crew.domain.inputs import InputRejected, clean_request
 from ops_crew.domain.correction import REFLECTED_INTENTS, correctable_problems, reflection_route
+from ops_crew.domain.followup import followup_text, reply_problem
+from ops_crew.domain.idempotency import idempotency_key
 from ops_crew.domain.planning import (
     SKIPPED,
     StepResult,
@@ -68,14 +71,16 @@ from ops_crew.domain.planning import (
     plan_problems,
     step_input,
 )
-from ops_crew.domain.policy import Outcome, authorize
+from ops_crew.domain.policy import SIDE_EFFECTS, Outcome, authorize
 from ops_crew.domain.ports import (
+    EpisodeMemory,
     Planner,
     PlanRepairRequest,
     Proposer,
     ProposerError,
     Refiner,
     RepairRequest,
+    RequestRecord,
     SimilarityIndex,
     SimilarityReport,
 )
@@ -101,6 +106,8 @@ class FlowDeps:
     refiner: Refiner | None = None  # None: blind retries, no reflection (original behaviour)
     planner: Planner | None = None  # None: one request = one intent (no planning)
     similarity: SimilarityIndex | None = None  # None: no near-duplicate checks (OPS_MEMORY=false)
+    episodes: EpisodeMemory | None = None      # None: no episodic memory (OPS_MEMORY=false)
+    now: Callable[[], datetime] = field(default=lambda: datetime.now(timezone.utc))
 
 
 class OpsState(BaseModel):
@@ -113,6 +120,7 @@ class OpsState(BaseModel):
     input_error: str | None = None
     expected_intent: Intent | None = None  # plan step: the intent it was planned (and approved) for
     inherited_suspicious: bool = False     # plan step: injection markers anywhere in the full request
+    reply_to: str | None = None            # answers the clarifying question of this earlier request
     attempts: int = 0
     errors: list[str] = Field(default_factory=list)
     proposal: ActionProposal | None = None
@@ -137,21 +145,36 @@ def run_with_timeout(fn: Callable[[], Any], timeout: float, what: str = "crew"):
         pool.shutdown(wait=False, cancel_futures=True)
 
 
+def _reply_text(deps: FlowDeps, reply_to: str, answer: str) -> str:
+    """Join an earlier request, its clarifying question and this answer (episodic memory)."""
+    if deps.episodes is None:
+        raise InputRejected("replies need episodic memory (OPS_MEMORY=true)")
+    record = deps.episodes.get_request(reply_to)
+    problem = reply_problem(record, reply_to, deps.now(), timedelta(minutes=deps.settings.clarification_ttl_minutes))
+    if problem:
+        raise InputRejected(problem)
+    return followup_text(record, answer)
+
+
 def _intake(flow, inherited_suspicious: bool = False) -> None:
-    """Shared first step of both flows: correlation id, request cleanup, injection markers."""
+    """Shared first step of both flows: correlation id, request cleanup, injection markers.
+    A reply to a clarifying question is joined with the earlier request first; the joined text
+    is checked like any request (size, cleanup, injection markers over all of it)."""
     state = flow.state
     if not state.correlation_id:
         state.correlation_id = flow._deps.new_correlation_id()
+    reply = {"reply_to": state.reply_to} if state.reply_to else {}
     try:
-        clean = clean_request(state.request, flow._deps.settings.max_request_chars)
+        text = _reply_text(flow._deps, state.reply_to, state.request) if state.reply_to else state.request
+        clean = clean_request(text, flow._deps.settings.max_request_chars)
     except InputRejected as e:
         state.input_error = str(e)
-        flow._audit("intake", role=state.role.value, accepted=False, error=str(e))
+        flow._audit("intake", role=state.role.value, accepted=False, error=str(e), **reply)
         return
     state.clean_text = clean.text
     state.suspicious = clean.suspicious or inherited_suspicious
     flow._audit("intake", role=state.role.value, accepted=True, chars=len(clean.text),
-                suspicious=state.suspicious, injection_markers=list(clean.markers))
+                suspicious=state.suspicious, injection_markers=list(clean.markers), **reply)
 
 
 class OpsFlow(Flow[OpsState]):
@@ -333,13 +356,24 @@ class OpsFlow(Flow[OpsState]):
                     score=round(closest.score, 3) if closest else None, eval_score=round(report.eval_score, 3))
         return report
 
+    def _declined_before(self, proposal: ActionProposal) -> datetime | None:
+        """Episodic memory: did a human decline this exact action before? (Fails open: without
+        the memory, the action is judged exactly as before Level 2.)"""
+        if self._deps.episodes is None or proposal.intent not in SIDE_EFFECTS:
+            return None
+        try:
+            return self._deps.episodes.declined_before(idempotency_key(proposal))
+        except Exception as e:
+            self._audit("memory_read_failed", error_type=type(e).__name__, error=str(e)[:300])
+            return None
+
     @router("reviewed")
     def authorize_proposal(self):
         proposal = self.state.proposal
         decision = authorize(proposal, self.state.role, self._deps.repo,
                              suspicious_input=self.state.suspicious,
                              already_executed=self._deps.executor.already_executed(proposal, self.state.request_id),
-                             similarity=self._similarity(proposal))
+                             similarity=self._similarity(proposal), declined_at=self._declined_before(proposal))
         self.state.decision_reasons = decision.reasons
         self._audit("authorization", decision=decision.outcome.value, reasons=decision.reasons)
         return {Outcome.ALLOW: "authorized", Outcome.DENY: "denied",
@@ -364,6 +398,12 @@ class OpsFlow(Flow[OpsState]):
 
     @listen("declined")
     def decline(self):
+        if self._deps.episodes is not None:  # remembered: the same action needs a human next time too
+            try:
+                self._deps.episodes.record_decline(idempotency_key(self.state.proposal), self.state.correlation_id,
+                                                   self._deps.now())
+            except Exception as e:
+                self._audit("memory_write_failed", error_type=type(e).__name__, error=str(e)[:300])
         return self._finish("declined", "a human declined the action")
 
     @listen(or_("authorized", "approved"))
@@ -393,6 +433,7 @@ class OpsResult:
     planned: bool = False     # a checked plan was used (False: no planner, or it was unavailable)
     plan: dict | None = None  # hash, steps, attempts and repairs of that plan
     steps: list[StepResult] = field(default_factory=list)  # PlanFlow: one result per step, in plan order
+    request: str = ""         # the cleaned request that ran (for a reply: joined with the earlier one)
 
 
 class PlanState(BaseModel):
@@ -403,6 +444,7 @@ class PlanState(BaseModel):
     clean_text: str = ""
     suspicious: bool = False
     input_error: str | None = None
+    reply_to: str | None = None
     plan: Plan | None = None  # None: no usable plan, the request runs as one unplanned step
     plan_attempts: int = 0
     plan_repairs: int = 0
@@ -576,26 +618,28 @@ class PlanFlow(Flow[PlanState]):
 
 def run_single(deps: FlowDeps, request: str, role: Role, request_id: str | None = None, *,
                correlation_id: str | None = None, expected_intent: Intent | None = None,
-               inherited_suspicious: bool = False) -> OpsResult:
+               inherited_suspicious: bool = False, reply_to: str | None = None) -> OpsResult:
     """One request, one intent: the OpsFlow pipeline. PlanFlow runs every step through it."""
     flow = OpsFlow(deps, suppress_flow_events=True)
     flow.kickoff(inputs={"request": request, "role": role.value, "request_id": request_id,
                          "correlation_id": correlation_id or "", "expected_intent": expected_intent,
-                         "inherited_suspicious": inherited_suspicious})
+                         "inherited_suspicious": inherited_suspicious, "reply_to": reply_to})
     s = flow.state
     return OpsResult(
         correlation_id=s.correlation_id, outcome=s.outcome, message=s.message, data=dict(s.data),
         attempts=s.attempts, errors=list(s.errors), intent=s.proposal.intent.value if s.proposal else None,
         params=s.proposal.params.model_dump(exclude_none=True) if s.proposal else {},
         tool_calls=list(s.tool_calls), repairs=s.repairs, reflection=dict(s.reflection) or None,
+        request=s.clean_text,
     )
 
 
-def run_plan(deps: FlowDeps, request: str, role: Role, request_id: str | None = None) -> OpsResult:
+def run_plan(deps: FlowDeps, request: str, role: Role, request_id: str | None = None, *,
+             reply_to: str | None = None) -> OpsResult:
     """Plan first (PlanFlow), then run the steps. A one-step result is reported exactly like an
     unplanned run; several steps report their results in `steps`."""
     flow = PlanFlow(deps, suppress_flow_events=True)
-    flow.kickoff(inputs={"request": request, "role": role.value, "request_id": request_id})
+    flow.kickoff(inputs={"request": request, "role": role.value, "request_id": request_id, "reply_to": reply_to})
     s = flow.state
     steps = [result for result, _ in flow._runs]
     runs = [run for _, run in flow._runs if run is not None]
@@ -615,12 +659,37 @@ def run_plan(deps: FlowDeps, request: str, role: Role, request_id: str | None = 
         intent=only.intent if only else None, params=dict(only.params) if only else {},
         tool_calls=[c for r in runs for c in r.tool_calls], repairs=sum(r.repairs for r in runs),
         reflection=only.reflection if only else None, planned=s.plan is not None, plan=plan, steps=steps,
+        request=s.clean_text,
     )
 
 
-def run_request(deps: FlowDeps, request: str, role: Role, request_id: str | None = None) -> OpsResult:
+def _remember(deps: FlowDeps, result: OpsResult, role: Role, reply_to: str | None) -> None:
+    """Episodic memory: one record per finished request, written by code. A request that never
+    got past intake (invalid input, an unacceptable reply) is not worth remembering."""
+    if deps.episodes is None or not result.request:
+        return
+    record = RequestRecord(
+        correlation_id=result.correlation_id, ts=deps.now(), role=role.value, request=result.request,
+        outcome=result.outcome, message=result.message, intent=result.intent,
+        plan_intents=tuple(st["intent"] for st in result.plan["steps"]) if result.plan else (),
+        step_outcomes=tuple(st.outcome for st in result.steps),
+        reflection_score=(result.reflection or {}).get("score"), reply_to=reply_to,
+    )
+    try:
+        deps.episodes.record_request(record)
+    except Exception as e:  # memory must never fail a request that already ran
+        deps.audit.record(result.correlation_id, "memory_write_failed", error_type=type(e).__name__,
+                          error=str(e)[:300])
+
+
+def run_request(deps: FlowDeps, request: str, role: Role, request_id: str | None = None, *,
+                reply_to: str | None = None) -> OpsResult:
     """Entry point: planned (PlanFlow) when deps.planner is set, otherwise one request with one
-    intent (OpsFlow)."""
+    intent (OpsFlow). `reply_to`: the correlation id of an earlier request that asked a
+    clarifying question; this request is the answer (needs episodic memory)."""
     if deps.planner is None:
-        return run_single(deps, request, role, request_id)
-    return run_plan(deps, request, role, request_id)
+        result = run_single(deps, request, role, request_id, reply_to=reply_to)
+    else:
+        result = run_plan(deps, request, role, request_id, reply_to=reply_to)
+    _remember(deps, result, role, reply_to)
+    return result

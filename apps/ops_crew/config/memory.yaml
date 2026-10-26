@@ -14,6 +14,12 @@ embeddings:
 # (near_duplicate) or to an eval question (near_eval): a human then approves the add. Exact
 # duplicates and eval questions are still rejected by policy. Thresholds depend on the embedder:
 # hashing is calibrated on this repo's data in tests/test_memory.py; re-tune for a real model.
+# `cluster`: how similar failed requests must be to form one group in a consolidation report.
 similarity:
-  hashing: {near_duplicate: 0.6, near_eval: 0.6}
-  openai_compatible: {near_duplicate: 0.9, near_eval: 0.9}
+  hashing: {near_duplicate: 0.6, near_eval: 0.6, cluster: 0.5}
+  openai_compatible: {near_duplicate: 0.9, near_eval: 0.9, cluster: 0.8}
+
+# Episodic memory (state_dir/memory.db): finished requests (for --reply-to and consolidation) and
+# human declines (the same action needs a human again). Pruned by `python -m ops_crew.consolidate --prune`.
+episodes:
+  retention_days: {request: 30, decline: 180}

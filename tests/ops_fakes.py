@@ -1,6 +1,7 @@
 """Shared fakes for ops_crew tests: scripted planner / proposer / refiner, builders, dataset copies."""
 import json
 import shutil
+from datetime import datetime, timezone
 
 from ops_crew.domain.actions import ActionExecutor
 from ops_crew.domain.audit import AuditLog, MemorySink
@@ -132,8 +133,12 @@ def copy_datasets(tmp_path):
     return DatasetRepository(train, evals)
 
 
+T0 = datetime(2026, 10, 1, 12, 0, tzinfo=timezone.utc)
+
+
 def build_deps(tmp_path, proposer, approvals=None, refiner=None, planner=None, memory=False, **settings_overrides):
-    """`memory=True` wires the real DatasetSimilarity (hashing embedder: offline, deterministic)."""
+    """`memory=True` wires the real DatasetSimilarity (hashing embedder: offline, deterministic) and
+    SqliteEpisodeMemory in tmp_path, with the clock fixed at T0."""
     from ops_crew.flow import FlowDeps  # needs crewai
 
     repo = copy_datasets(tmp_path)
@@ -152,12 +157,14 @@ def build_deps(tmp_path, proposer, approvals=None, refiner=None, planner=None, m
         planner=planner,
     )
     if memory:
-        from ops_crew.memory_adapters import DatasetSimilarity, load_memory_config
+        from ops_crew.memory_adapters import DatasetSimilarity, SqliteEpisodeMemory, load_memory_config
 
         deps.similarity = DatasetSimilarity.from_config(repo, load_memory_config(deps.settings.config_dir, env={}),
                                                         env={})
+        deps.episodes = SqliteEpisodeMemory(deps.settings.memory_db_path)
+        deps.now = lambda: T0  # tests move time by replacing deps.now
     return deps, sink
 
 
 __all__ = ["make_run", "make_plan", "FakePlanner", "FakeProposer", "FakeRefiner", "RecordingApprovals",
-           "copy_datasets", "build_deps", "ProposerError"]
+           "copy_datasets", "build_deps", "ProposerError", "T0"]

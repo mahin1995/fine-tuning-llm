@@ -1,5 +1,7 @@
-"""What the deterministic flow needs from the probabilistic layers (planner, crew, refiner)."""
+"""What the deterministic flow needs from the probabilistic layers (planner, crew, refiner) and
+from memory (similarity, episodes)."""
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Protocol
 
 from ops_crew.domain.working_memory import VerifiedFacts
@@ -50,6 +52,40 @@ class SimilarityIndex(Protocol):
         ...
 
     def report(self, text: str) -> SimilarityReport:
+        ...
+
+
+@dataclass(frozen=True)
+class RequestRecord:
+    """One finished request, written by code at the end of every run (episodic memory)."""
+    correlation_id: str
+    ts: datetime
+    role: str
+    request: str                       # the cleaned request text (untrusted user text)
+    outcome: str
+    message: str                       # for clarification_needed: the clarifying question (model-written)
+    intent: str | None = None
+    plan_intents: tuple[str, ...] = ()
+    step_outcomes: tuple[str, ...] = ()
+    reflection_score: float | None = None
+    reply_to: str | None = None        # the request whose clarifying question this one answered
+
+
+class EpisodeMemory(Protocol):
+    """What happened in earlier runs (ops_crew/memory_adapters.py, SQLite)."""
+
+    def record_request(self, record: RequestRecord) -> None:
+        ...
+
+    def get_request(self, correlation_id: str) -> RequestRecord | None:
+        ...
+
+    def record_decline(self, action_key: str, correlation_id: str, ts: datetime) -> None:
+        """A human declined this exact action (its idempotency key without request id)."""
+        ...
+
+    def declined_before(self, action_key: str) -> datetime | None:
+        """When a human last declined this exact action, if ever."""
         ...
 
 
